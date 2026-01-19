@@ -4,7 +4,7 @@ import yfinance as yf
 from typing import Dict, List, Optional
 
 
-class MonthlySmaFixedGroupWithBitcoin:
+class ZephyrFivePillar:
     """
     Monthly rebalanced multi-asset strategy with:
     - SMA filter
@@ -312,7 +312,7 @@ class MonthlySmaFixedGroupWithBitcoin:
 # MAIN
 # ===========================================================
 if __name__ == "__main__":
-    strategy = MonthlySmaFixedGroupWithBitcoin(
+    strategy = ZephyrFivePillar(
         start="2012-01-01",
         enable_vol_targeting=True,
         target_vol=0.75,

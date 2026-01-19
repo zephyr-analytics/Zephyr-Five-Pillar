@@ -4,19 +4,20 @@ from typing import Dict, List, Optional
 import numpy as np
 import pandas as pd
 
-class MonthlySmaFixedGroupWithBitcoinAlgo(QCAlgorithm):
+
+class ZephyrFivePillar(QCAlgorithm):
     """Monthly rebalanced multi-asset strategy with SMA and volatility targeting."""
 
-    def ZephyrFivePillars(self) -> None:
+    def initialize(self) -> None:
         """Configure the strategy, assets, indicators, and schedule.
 
         Returns
         -------
         None
         """
-        self.SetStartDate(2012, 1, 1)
-        self.SetCash(100000)
-
+        self.set_start_date(2012, 1, 1)
+        self.set_cash(100_000)
+        self.set_security_initializer(lambda security: security.SetFeeModel(ZeroFeeModel()))
         # === User Options ===
         self.enable_vol_targeting = True
         self.target_vol = 0.75
@@ -58,16 +59,16 @@ class MonthlySmaFixedGroupWithBitcoinAlgo(QCAlgorithm):
             for s in self.all_symbols
         }
 
-        self.SetWarmUp(max(self.sma_period, self.max_lookback, self.vol_lookback))
+        self.set_warm_up(max(self.sma_period, self.max_lookback, self.vol_lookback))
 
-        self.Schedule.On(
+        self.schedule.On(
             self.DateRules.MonthEnd(self.symbols[0]),
             self.TimeRules.BeforeMarketClose(self.symbols[0], 5),
-            self.Rebalance
+            self.rebalance
         )
 
 
-    def Rebalance(self) -> None:
+    def rebalance(self) -> None:
         """Rebalance portfolio allocations at the scheduled interval.
 
         Returns
@@ -90,7 +91,7 @@ class MonthlySmaFixedGroupWithBitcoinAlgo(QCAlgorithm):
 
         # === Compute momentum for sectors ===
         sector_symbols = [s for s in self.symbols if s.Value in self.sector_tickers]
-        sector_momentum = self.ComputeMomentum(sector_symbols, history)
+        sector_momentum = self.compute_momentum(sector_symbols, history)
         top_sectors = sorted(sector_momentum, key=sector_momentum.get, reverse=True)[:self.sector_count]
 
         # === Build group map ===
@@ -112,7 +113,7 @@ class MonthlySmaFixedGroupWithBitcoinAlgo(QCAlgorithm):
         total_allocated = 0
         for group, syms in group_map.items():
             group_weight = self.category_target_weights.get(group, 0.0)
-            eligible = [s for s in syms if self.PassesSma(s)]
+            eligible = [s for s in syms if self.passes_sma(s)]
             if not eligible:
                 self.Debug(f"{self.Time.date()} | {group} group: all failed SMA")
                 continue
@@ -123,21 +124,21 @@ class MonthlySmaFixedGroupWithBitcoinAlgo(QCAlgorithm):
                 weight = raw_weight
 
                 if self.enable_vol_targeting:
-                    vol = self.ComputeRealizedVolatility(s, history)
+                    vol = self.compute_realized_volatility(s, history)
                     if vol is None:
                         continue
                     vol_scalar = min(1.0, self.target_vol / vol)
                     weight *= vol_scalar
                     self.Debug(f"{self.Time.date()} | {s.Value} vol={round(vol, 3)} scaled_weight={round(weight, 3)}")
 
-                self.SetHoldings(s, weight)
+                self.set_holdings(s, weight)
                 total_allocated += weight
 
-        self.Debug(f"{self.Time.date()} | Top Sectors: {[s.Value for s in top_sectors]} | "
+        self.debug(f"{self.Time.date()} | Top Sectors: {[s.Value for s in top_sectors]} | "
                 f"Allocated: {round(total_allocated, 3)} | Cash held: {round(1.0 - total_allocated, 3)}")
 
 
-    def ComputeMomentum(self, symbols: List[Symbol], history: pd.DataFrame) -> Dict[Symbol, float]:
+    def compute_momentum(self, symbols: List[Symbol], history: pd.DataFrame) -> Dict[Symbol, float]:
         """Compute average multi-horizon momentum scores for symbols.
 
         Parameters
@@ -171,7 +172,7 @@ class MonthlySmaFixedGroupWithBitcoinAlgo(QCAlgorithm):
         return momentum_scores
 
 
-    def ComputeRealizedVolatility(self, symbol: Symbol, history: pd.DataFrame) -> Optional[float]:
+    def compute_realized_volatility(self, symbol: Symbol, history: pd.DataFrame) -> Optional[float]:
         """Compute annualized realized volatility for a symbol.
 
         Parameters
@@ -202,7 +203,7 @@ class MonthlySmaFixedGroupWithBitcoinAlgo(QCAlgorithm):
         return ann_vol
 
 
-    def PassesSma(self, symbol: Symbol) -> bool:
+    def passes_sma(self, symbol: Symbol) -> bool:
         """Check whether a symbol is trading above its SMA.
 
         Parameters
@@ -218,4 +219,4 @@ class MonthlySmaFixedGroupWithBitcoinAlgo(QCAlgorithm):
         sma = self.smas[symbol]
         if not sma.IsReady:
             return False
-        return self.Securities[symbol].Price > sma.Current.Value
+        return self.securities[symbol].Price > sma.Current.Value
