@@ -17,7 +17,7 @@ class ZephyrFivePillar(QCAlgorithm):
         """
         self.set_start_date(2012, 1, 1)
         self.set_cash(100_000)
-        self.set_security_initializer(lambda security: security.SetFeeModel(ZeroFeeModel()))
+
         # === User Options ===
         self.enable_vol_targeting = True
         self.target_vol = 0.75
@@ -52,7 +52,8 @@ class ZephyrFivePillar(QCAlgorithm):
         self.symbols = [self.AddEquity(t, Resolution.Daily).Symbol for t in all_tickers]
         self.btc_symbol = self.AddCrypto("BTCUSD", Resolution.Daily).Symbol
         self.all_symbols = self.symbols + [self.btc_symbol]
-
+        for symbol in self.all_symbols:
+            self.securities[symbol].fee_model = ConstantFeeModel(0)
         # === Indicators ===
         self.smas = {
             s: self.SMA(s, self.sma_period, Resolution.Daily)
