@@ -12,6 +12,21 @@ class MonthlySmaFixedGroupWithBitcoin:
     - sector ranking
     - volatility targeting
     - Bitcoin inclusion
+
+    Parameters
+    ----------
+    start : str, optional
+        Start date for historical data in YYYY-MM-DD format.
+    capital : int or float, optional
+        Starting capital (stored for reference).
+    enable_vol_targeting : bool, optional
+        Toggle volatility targeting during allocation.
+    target_vol : float, optional
+        Annualized volatility target per asset.
+    cash_buffer : float, optional
+        Cash fraction to leave unallocated.
+    sector_count : int, optional
+        Number of top-momentum sectors to include.
     """
 
     def __init__(
@@ -23,6 +38,24 @@ class MonthlySmaFixedGroupWithBitcoin:
         cash_buffer=0.05,
         sector_count=4,
     ):
+        """
+        Initialize strategy configuration and universe definitions.
+
+        Parameters
+        ----------
+        start : str, optional
+            Start date for historical data in YYYY-MM-DD format.
+        capital : int or float, optional
+            Starting capital (stored for reference).
+        enable_vol_targeting : bool, optional
+            Toggle volatility targeting during allocation.
+        target_vol : float, optional
+            Annualized volatility target per asset.
+        cash_buffer : float, optional
+            Cash fraction to leave unallocated.
+        sector_count : int, optional
+            Number of top-momentum sectors to include.
+        """
         self.start = start
         self.capital = capital
         self.enable_vol_targeting = enable_vol_targeting
@@ -71,6 +104,14 @@ class MonthlySmaFixedGroupWithBitcoin:
     # -------------------------------------------------------
 
     def fetch_data(self):
+        """
+        Download and normalize historical price data.
+
+        Returns
+        -------
+        None
+            Populates `self.prices` and `self.sma` in place.
+        """
         raw = yf.download(
             self.all_tickers,
             start=self.start,
@@ -103,11 +144,41 @@ class MonthlySmaFixedGroupWithBitcoin:
     # -------------------------------------------------------
 
     def passes_sma(self, ticker, date) -> bool:
+        """
+        Check whether a ticker is trading above its SMA on a given date.
+
+        Parameters
+        ----------
+        ticker : str
+            Ticker symbol to evaluate.
+        date : pandas.Timestamp
+            Date to evaluate.
+
+        Returns
+        -------
+        bool
+            True if price is above SMA, otherwise False.
+        """
         if ticker not in self.sma.columns:
             return False
         return self.prices.loc[date, ticker] > self.sma.loc[date, ticker]
 
     def compute_momentum(self, tickers, date) -> Dict[str, float]:
+        """
+        Compute multi-horizon momentum scores for a set of tickers.
+
+        Parameters
+        ----------
+        tickers : list of str
+            Ticker symbols to score.
+        date : pandas.Timestamp
+            End date for the lookback window.
+
+        Returns
+        -------
+        dict
+            Mapping of ticker to average momentum score.
+        """
         scores = {}
         for t in tickers:
             px = self.prices[t].loc[:date].dropna()
@@ -123,6 +194,21 @@ class MonthlySmaFixedGroupWithBitcoin:
         return scores
 
     def realized_vol(self, ticker, date) -> Optional[float]:
+        """
+        Compute annualized realized volatility for a ticker.
+
+        Parameters
+        ----------
+        ticker : str
+            Ticker symbol to evaluate.
+        date : pandas.Timestamp
+            End date for the volatility lookback.
+
+        Returns
+        -------
+        float or None
+            Annualized volatility if enough data is available.
+        """
         px = self.prices[ticker].loc[:date].dropna()
         if len(px) < self.vol_lookback + 1:
             return None
@@ -133,8 +219,20 @@ class MonthlySmaFixedGroupWithBitcoin:
     # -------------------------------------------------------
     # Rebalance
     # -------------------------------------------------------
-
     def rebalance(self, date) -> Dict[str, float]:
+        """
+        Compute portfolio weights for a given rebalance date.
+
+        Parameters
+        ----------
+        date : pandas.Timestamp
+            Date to rebalance on.
+
+        Returns
+        -------
+        dict
+            Mapping of asset ticker to portfolio weight, including CASH.
+        """
         weights = {}
 
         # --- Sector ranking ---
@@ -183,6 +281,14 @@ class MonthlySmaFixedGroupWithBitcoin:
     # -------------------------------------------------------
 
     def run(self) -> pd.DataFrame:
+        """
+        Run the strategy and return allocation weights by rebalance date.
+
+        Returns
+        -------
+        pandas.DataFrame
+            Rows of weights with columns: date, asset, weight.
+        """
         self.fetch_data()
 
         rebalance_dates = self.prices.resample("M").last().index
@@ -201,7 +307,6 @@ class MonthlySmaFixedGroupWithBitcoin:
                 })
 
         return pd.DataFrame(records)
-
 
 # ===========================================================
 # MAIN
