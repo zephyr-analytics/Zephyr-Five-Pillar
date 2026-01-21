@@ -66,3 +66,33 @@ All local settings live in `ZephyrFivePillar.__init__` in `zephyr_five_pillar_lo
 ## Notes
 - All assets must have enough history for SMA, momentum, and volatility calculations.
 - Local data uses `yfinance` with adjusted prices.
+
+## Portfolio Formula
+Pieces:
+1. Sector selection:
+   - `TopSectors = top_k( momentum(t), k=sector_count )`
+2. Eligible symbols (SMA filter):
+   - `Eligible(g) = { s in Group(g) | Price_s > SMA_s }`
+3. Group returns:
+   - `r_g(t) = mean( returns_s(t) for s in Eligible(g) )`
+4. Group edge (persistence):
+   - `edge_g = mean( r_g(t) > 0, t in last winrate_lookback )`
+5. Group volatility:
+   - `vol_g = std( log(1 + r_g(t)) for t in last vol_lookback ) * sqrt(252)`
+6. Edge normalization with epsilon:
+   - `w_raw_g = (edge_g + epsilon) / sum_g(edge_g + epsilon)`
+7. Group vol targeting:
+   - `w_scaled_g = w_raw_g * min(1, group_vol_target / vol_g)`
+8. Crypto cap and redistribution:
+   - `w_crypto = min(w_scaled_crypto, crypto_cap)`
+   - `excess = w_scaled_crypto - w_crypto`
+   - `w_other_g = w_scaled_g + excess * (w_scaled_g / sum_other w_scaled_g)`
+9. Within-group allocation:
+   - `w_s = w_group / |Eligible(g)| for s in Eligible(g)`
+10. Cash:
+   - `w_cash = max(0, 1 - sum_s w_s)`
+
+Summary:
+- `w_s = (w_group / |Eligible(g)|) for s in Eligible(g)`
+- `w_group = cap_and_scale( normalize(edge_g + epsilon), vol_g, group_vol_target, crypto_cap )`
+- `w_cash = 1 - sum_s w_s`
