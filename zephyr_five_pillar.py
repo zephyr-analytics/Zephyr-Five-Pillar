@@ -6,9 +6,9 @@ import pandas as pd
 
 class ZephyrFivePillar(QCAlgorithm):
 
-    def Initialize(self) -> None:
-        self.SetStartDate(2012, 1, 1)
-        self.SetCash(100_000)
+    def initialize(self) -> None:
+        self.set_start_date(2012, 1, 1)
+        self.set_cash(100_000)
 
         # ============================
         # User Options
@@ -51,9 +51,9 @@ class ZephyrFivePillar(QCAlgorithm):
             self.symbols[g] = []
             for t in tickers:
                 if t in ["BTCUSD", "ETHUSD"]:
-                    sym = self.AddCrypto(t, Resolution.Daily).Symbol
+                    sym = self.AddCrypto(t, Resolution.DAILY).Symbol
                 else:
-                    sym = self.AddEquity(t, Resolution.Daily).Symbol
+                    sym = self.AddEquity(t, Resolution.DAILY).Symbol
                 self.symbols[g].append(sym)
                 self.Securities[sym].FeeModel = ConstantFeeModel(0)
 
@@ -63,7 +63,7 @@ class ZephyrFivePillar(QCAlgorithm):
         # Indicators
         # ============================
         self.smas = {
-            s: self.SMA(s, self.sma_period, Resolution.Daily)
+            s: self.SMA(s, self.sma_period, Resolution.DAILY)
             for s in self.all_symbols
         }
 
@@ -91,7 +91,7 @@ class ZephyrFivePillar(QCAlgorithm):
         history = self.history(
             self.all_symbols,
             self.max_lookback + 1,
-            Resolution.Daily,
+            Resolution.DAILY,
             data_normalization_mode=DataNormalizationMode.TOTAL_RETURN
         )
 
@@ -101,7 +101,7 @@ class ZephyrFivePillar(QCAlgorithm):
         # 1) Momentum-based sector selection
         # ------------------------------------------------
         sector_syms = self.symbols["sectors"]
-        sector_mom = self.ComputeMomentum(sector_syms, closes)
+        sector_mom = self.compute_momentum(sector_syms, closes)
         top_sectors = sorted(
             sector_mom, key=sector_mom.get, reverse=True
         )[:self.sector_count]
@@ -123,7 +123,7 @@ class ZephyrFivePillar(QCAlgorithm):
         for g, syms in risk_groups.items():
             eligible = [
                 s for s in syms
-                if s in closes.columns and self.PassesSMA(s)
+                if s in closes.columns and self.passes_sma(s)
             ]
             if not eligible:
                 continue
@@ -191,7 +191,7 @@ class ZephyrFivePillar(QCAlgorithm):
             syms = risk_groups[g]
             alloc = wg / len(syms)
             for s in syms:
-                if self.PassesSMA(s):
+                if self.passes_sma(s):
                     self.SetHoldings(s, alloc)
 
         self.SetHoldings(self.symbols["cash"][0], cash_weight)
@@ -206,7 +206,7 @@ class ZephyrFivePillar(QCAlgorithm):
     # Helpers
     # ====================================================
 
-    def ComputeMomentum(self, symbols: List[Symbol], closes: pd.DataFrame) -> Dict[Symbol, float]:
+    def compute_momentum(self, symbols: List[Symbol], closes: pd.DataFrame) -> Dict[Symbol, float]:
         scores = {}
         for s in symbols:
             if s not in closes.columns:
@@ -221,7 +221,7 @@ class ZephyrFivePillar(QCAlgorithm):
             scores[s] = float(np.mean(rets))
         return scores
 
-    def PassesSMA(self, symbol: Symbol) -> bool:
+    def passes_sma(self, symbol: Symbol) -> bool:
         if not self.enable_sma_filter:
             return True
         sma = self.smas[symbol]
