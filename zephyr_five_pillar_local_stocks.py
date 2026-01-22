@@ -51,7 +51,7 @@ class ZephyrFivePillarLocal:
                 "VOX", "VCR", "VDC", "VDE", "VFH", "VHT",
                 "VIS", "VGT", "VAW", "VNQ", "VPU"
             ],
-            "crypto": ["BTC-USD", "ETH-USD"],
+            "crypto": ["IBIT", "ETHA"],
             "cash": ["BIL"],
         }
 
