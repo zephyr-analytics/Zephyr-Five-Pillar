@@ -69,11 +69,10 @@ class ZephyrFivePillar:
         raw = yf.download(
             self.all_tickers,
             start=self.start,
-            auto_adjust=True,
             progress=False,
         )
 
-        prices = raw["Close"] if isinstance(raw.columns, pd.MultiIndex) else raw
+        prices = raw["Adj Close"] if isinstance(raw.columns, pd.MultiIndex) else raw
         prices = prices.dropna(how="all").sort_index()
 
         self.prices = prices
