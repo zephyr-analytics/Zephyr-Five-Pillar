@@ -14,7 +14,7 @@ class ZephyrFivePillarLocal:
     # ====================================================
     def __init__(
         self,
-        start="2012-01-01",
+        start="2018-01-01",
         enable_sma_filter=True,
         winrate_lookback=63,
         vol_lookback=63,
