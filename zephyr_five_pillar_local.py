@@ -69,6 +69,7 @@ class ZephyrFivePillar:
         raw = yf.download(
             self.all_tickers,
             start=self.start,
+            auto_adjust=True,
             progress=False,
         )
 

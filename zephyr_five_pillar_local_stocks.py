@@ -21,7 +21,7 @@ class ZephyrFivePillarLocal:
         sma_period=168,
         stock_ema_period=168,
         sector_count=4,
-        stock_count=10,
+        stock_count=5,
         group_vol_target=0.10,
         crypto_cap=0.10,
     ):
@@ -59,7 +59,10 @@ class ZephyrFivePillarLocal:
         # Dynamic stock universe (from CSV)
         # ------------------------------------------------
         self.stock_symbols = (
-            pd.read_csv("stocks.csv", header=None)[0]
+            pd.read_csv("stocks.csv")
+            .loc[:, "Symbol"]
+            .astype(str)
+            .str.strip()
             .str.upper()
             .tolist()
         )
@@ -82,10 +85,11 @@ class ZephyrFivePillarLocal:
         raw = yf.download(
             self.all_tickers,
             start=self.start,
+            auto_adjust=True,
             progress=False,
         )
 
-        prices = raw["Adj Close"] if isinstance(raw.columns, pd.MultiIndex) else raw
+        prices = raw["Close"] if isinstance(raw.columns, pd.MultiIndex) else raw
         prices = prices.dropna(how="all").sort_index()
 
         self.prices = prices
