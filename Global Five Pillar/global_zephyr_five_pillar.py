@@ -74,7 +74,7 @@ class ZephyrFivePillar(QCAlgorithm):
 
         self.enable_stocks = True
         self.enable_sectors = True
-        self.enable_treasury_kill_switch = True
+        self.enable_treasury_kill_switch = False
 
         self.momentum_lookbacks = [21, 63, 126, 189, 252]
         self.max_lookback = max(self.momentum_lookbacks)
@@ -401,21 +401,41 @@ class ZephyrFivePillar(QCAlgorithm):
         return scores
 
     def GetDurationRegimeForGroup(self, closes, symbols):
-        if len(symbols) >= 2:
-            return symbols
 
         def mom(s):
             if s not in closes.columns:
                 return -np.inf
             px = closes[s]
+            if len(px) < 127:
+                return -np.inf
             return np.mean([
-                px.iloc[-1] / px.iloc[-22] - 1,
-                px.iloc[-1] / px.iloc[-64] - 1,
-                px.iloc[-1] / px.iloc[-127] - 1,
+                px.iloc[-1] / px.iloc[-21] - 1,
+                px.iloc[-1] / px.iloc[-63] - 1,
+                px.iloc[-1] / px.iloc[-126] - 1,
             ])
 
-        s, i, l = symbols
-        return [s, i, l] if mom(l) > mom(i) > mom(s) else [s, i] if mom(i) > mom(s) else [s]
+        # -----------------------------
+        # 3-asset duration ladder
+        # -----------------------------
+        if len(symbols) == 3:
+            s, i, l = symbols
+            return (
+                [s, i, l] if mom(l) > mom(i) > mom(s)
+                else [s, i] if mom(i) > mom(s)
+                else [s]
+            )
+
+        # -----------------------------
+        # 2-asset ladder (HY case)
+        # -----------------------------
+        if len(symbols) == 2:
+            s, l = symbols
+            return [s, l] if mom(l) > mom(s) else [s]
+
+        # -----------------------------
+        # Fallback (single asset)
+        # -----------------------------
+        return symbols
 
     def ComputeGroupMomentum(self, symbols, closes):
         moms = []
@@ -426,10 +446,10 @@ class ZephyrFivePillar(QCAlgorithm):
             if len(px) < 253:
                 continue
             moms.append(np.mean([
-                px.iloc[-1] / px.iloc[-22] - 1,
-                px.iloc[-1] / px.iloc[-64] - 1,
-                px.iloc[-1] / px.iloc[-127] - 1,
-                px.iloc[-1] / px.iloc[-190] - 1,
-                px.iloc[-1] / px.iloc[-253] - 1,
+                px.iloc[-1] / px.iloc[-21] - 1,
+                px.iloc[-1] / px.iloc[-63] - 1,
+                px.iloc[-1] / px.iloc[-126] - 1,
+                px.iloc[-1] / px.iloc[-189] - 1,
+                px.iloc[-1] / px.iloc[-252] - 1,
             ]))
         return float(np.mean(moms)) if moms else 0.0
