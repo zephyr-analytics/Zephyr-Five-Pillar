@@ -202,9 +202,9 @@ class ZephyrBondOnly(QCAlgorithm):
             if len(px) < 127:
                 return -np.inf
             return np.mean([
-                px.iloc[-1] / px.iloc[-22] - 1,
-                px.iloc[-1] / px.iloc[-64] - 1,
-                px.iloc[-1] / px.iloc[-127] - 1,
+                px.iloc[-1] / px.iloc[-21] - 1,
+                px.iloc[-1] / px.iloc[-63] - 1,
+                px.iloc[-1] / px.iloc[-126] - 1,
             ])
 
         # -----------------------------
@@ -239,10 +239,10 @@ class ZephyrBondOnly(QCAlgorithm):
             if len(px) < 253:
                 continue
             moms.append(np.mean([
-                px.iloc[-1] / px.iloc[-22] - 1,
-                px.iloc[-1] / px.iloc[-64] - 1,
-                px.iloc[-1] / px.iloc[-127] - 1,
-                px.iloc[-1] / px.iloc[-190] - 1,
-                px.iloc[-1] / px.iloc[-253] - 1,
+                px.iloc[-1] / px.iloc[-21] - 1,
+                px.iloc[-1] / px.iloc[-63] - 1,
+                px.iloc[-1] / px.iloc[-126] - 1,
+                px.iloc[-1] / px.iloc[-189] - 1,
+                px.iloc[-1] / px.iloc[-252] - 1,
             ]))
         return float(np.mean(moms)) if moms else 0.0
