@@ -2,19 +2,54 @@ from AlgorithmImports import *
 from typing import Dict, List
 import numpy as np
 import pandas as pd
+from collections import defaultdict
 
 
 # ====================================================
-# Nasdaq-100 Constituents Universe
+# Sector-Neutral Large-Cap Universe
+# Top 20 stocks per sector by market cap
+# Modern Fundamental Universe (Python-safe)
 # ====================================================
-class ConstituentsUniverseSelectionModel(ETFConstituentsUniverseSelectionModel):
-    def __init__(self, universe_settings: UniverseSettings = None) -> None:
-        symbol = Symbol.Create("SPY", SecurityType.Equity, Market.USA)
-        super().__init__(
-            symbol,
-            universe_settings,
-            lambda constituents: [c.Symbol for c in constituents]
-        )
+class SectorTop20UniverseSelectionModel(FundamentalUniverseSelectionModel):
+    def __init__(self):
+        super().__init__(self._select)
+
+    def _select(self, fundamentals):
+
+        sector_buckets = defaultdict(list)
+
+        for f in fundamentals:
+            if not f.has_fundamental_data:
+                continue
+
+            # Basic investability filters
+            if f.price is None or f.price <= 5:
+                continue
+            if f.market_cap is None or f.market_cap <= 0:
+                continue
+
+            # Sector classification
+            sector = f.asset_classification.morningstar_sector_code
+            if sector is None:
+                continue
+
+            # -----------------------------
+            # Quality filter: Positive Free Cash Flow
+            # -----------------------------
+            fcf = f.financial_statements.cash_flow_statement.free_cash_flow
+            if fcf is None or fcf.Value is None or fcf.Value <= 0:
+                continue
+
+            sector_buckets[sector].append(f)
+
+        selected = []
+
+        # Top 20 by market cap per sector
+        for sector, stocks in sector_buckets.items():
+            stocks.sort(key=lambda f: f.market_cap, reverse=True)
+            selected.extend(f.symbol for f in stocks[:20])
+
+        return selected
 
 
 class ZephyrFivePillar(QCAlgorithm):
@@ -30,11 +65,16 @@ class ZephyrFivePillar(QCAlgorithm):
         self.winrate_lookback = 63
         self.vol_lookback = 63
         self.sma_period = 168
-        self.stock_ema_period = 168
+        self.bond_sma_period = 126
+        self.stock_ema_period = 189
         self.sector_count = 4
-        self.stock_count = 10
+        self.stock_count = 5
         self.group_vol_target = 0.10
         self.crypto_cap = 0.10
+
+        self.enable_stocks = True
+        self.enable_sectors = True
+        self.enable_treasury_kill_switch = True
 
         self.momentum_lookbacks = [21, 63, 126, 189, 252]
         self.max_lookback = max(self.momentum_lookbacks)
@@ -46,10 +86,11 @@ class ZephyrFivePillar(QCAlgorithm):
             "real": ["GLD", "DBC"],
             "corp_bonds": ["VCSH", "VCIT", "VCLT"],
             "treasury_bonds": ["VGSH", "VGIT", "VGLT"],
-            "equities": ["SPY", "QQQ", "DIA"],
+            "high_yield_bonds": ["SHYG", "HYG"],
+            "equities": ["VTI", "VEA", "VWO"],
             "sectors": [
-                "VOX", "VCR", "VDC", "VDE", "VFH", "VHT",
-                "VIS", "VGT", "VAW", "VNQ", "VPU"
+                "IXP","RXI","KXI","IXC","IXG","IXJ",
+                "EXI","IXN","MXI","REET","JXI"
             ],
             "crypto": ["BTCUSD", "ETHUSD"],
             "cash": ["BIL"]
@@ -69,13 +110,20 @@ class ZephyrFivePillar(QCAlgorithm):
 
         self.all_symbols = [s for group in self.symbols.values() for s in group]
 
+        # ----------------------------
+        # Bond symbol set
+        # ----------------------------
+        self.bond_symbols = set(
+            s for g in ["corp_bonds", "treasury_bonds", "high_yield_bonds"]
+            for s in self.symbols[g]
+        )
+
         # ============================
-        # Nasdaq-100 Dynamic Universe
+        # Universe
         # ============================
         self.UniverseSettings.Resolution = Resolution.Daily
-        self.AddUniverseSelection(
-            ConstituentsUniverseSelectionModel(self.UniverseSettings)
-        )
+        self.UniverseSettings.DataNormalizationMode = DataNormalizationMode.TOTAL_RETURN
+        self.SetUniverseSelection(SectorTop20UniverseSelectionModel())
 
         self.stock_symbols = set()
 
@@ -84,14 +132,19 @@ class ZephyrFivePillar(QCAlgorithm):
         # ============================
         self.smas = {
             s: self.SMA(s, self.sma_period, Resolution.Daily)
-            for s in self.all_symbols
+            for s in self.all_symbols if s not in self.bond_symbols
+        }
+
+        self.bond_smas = {
+            s: self.SMA(s, self.bond_sma_period, Resolution.Daily)
+            for s in self.bond_symbols
         }
 
         self.stock_emas: Dict[Symbol, IndicatorBase] = {}
 
         self.SetWarmUp(
             max(self.winrate_lookback, self.vol_lookback,
-                self.max_lookback, self.stock_ema_period)
+                self.max_lookback, self.stock_ema_period, self.bond_sma_period)
         )
 
         self.Schedule.On(
@@ -108,19 +161,10 @@ class ZephyrFivePillar(QCAlgorithm):
             if security.Symbol.SecurityType == SecurityType.Equity:
                 self.stock_symbols.add(security.Symbol)
 
-                # Stock EMA (189)
                 if security.Symbol not in self.stock_emas:
                     self.stock_emas[security.Symbol] = self.EMA(
                         security.Symbol,
                         self.stock_ema_period,
-                        Resolution.Daily
-                    )
-
-                # Ensure SMA exists too (safety)
-                if security.Symbol not in self.smas:
-                    self.smas[security.Symbol] = self.SMA(
-                        security.Symbol,
-                        self.sma_period,
                         Resolution.Daily
                     )
 
@@ -129,18 +173,25 @@ class ZephyrFivePillar(QCAlgorithm):
             self.stock_emas.pop(security.Symbol, None)
 
     # ====================================================
-    # Trend logic (STOCKS vs EVERYTHING ELSE)
+    # Trend logic
     # ====================================================
     def PassesTrend(self, symbol: Symbol) -> bool:
-        # Nasdaq-100 stocks → 189 EMA
+
+        # Stocks → EMA
         if symbol in self.stock_symbols:
             ema = self.stock_emas.get(symbol)
             return ema and ema.IsReady and self.Securities[symbol].Price > ema.Current.Value
 
-        # Everything else → SMA
+        # Bonds → bond SMA
+        if symbol in self.bond_symbols:
+            if not self.enable_sma_filter:
+                return True
+            sma = self.bond_smas.get(symbol)
+            return sma and sma.IsReady and self.Securities[symbol].Price > sma.Current.Value
+
+        # Everything else → default SMA
         if not self.enable_sma_filter:
             return True
-
         sma = self.smas.get(symbol)
         return sma and sma.IsReady and self.Securities[symbol].Price > sma.Current.Value
 
@@ -170,8 +221,13 @@ class ZephyrFivePillar(QCAlgorithm):
         corp_bond_syms = self.GetDurationRegimeForGroup(
             closes, self.symbols["corp_bonds"]
         )
+
         treasury_bond_syms = self.GetDurationRegimeForGroup(
             closes, self.symbols["treasury_bonds"]
+        )
+
+        high_yield_bond_syms = self.GetDurationRegimeForGroup(
+            closes, self.symbols["high_yield_bonds"]
         )
 
         # -----------------------------
@@ -197,11 +253,16 @@ class ZephyrFivePillar(QCAlgorithm):
             "real": self.symbols["real"],
             "corp_bonds": corp_bond_syms,
             "treasury_bonds": treasury_bond_syms,
+            "high_yield_bonds": high_yield_bond_syms,
             "equities": self.symbols["equities"],
-            "sectors": top_sectors,
-            "nasdaq100": top_stocks,
             "crypto": self.symbols["crypto"]
         }
+
+        if self.enable_sectors:
+            risk_groups["sectors"] = top_sectors
+
+        if self.enable_stocks:
+            risk_groups["stocks"] = top_stocks
 
         edges, vols = {}, {}
 
@@ -245,6 +306,15 @@ class ZephyrFivePillar(QCAlgorithm):
         if not edges:
             self.SetHoldings(self.symbols["cash"][0], 1.0)
             return
+        # ------------------------------------------------
+        # Treasury kill switch
+        # ------------------------------------------------
+        if self.enable_treasury_kill_switch and "treasury_bonds" not in edges:
+            self.Debug(
+                f"{self.Time.date()} | TREASURY KILL SWITCH → ALL CASH"
+            )
+            self.SetHoldings(self.symbols["cash"][0], 1.0)
+            return
 
         # -----------------------------
         # Normalize + vol targeting
@@ -257,6 +327,24 @@ class ZephyrFivePillar(QCAlgorithm):
             g: w * min(1.0, self.group_vol_target / vols[g])
             for g, w in w_raw.items()
         }
+
+        # -----------------------------
+        # Hierarchical gating with cash handling
+        # -----------------------------
+        cash_sink = 0.0
+
+        parent_children = {
+            "equities": ["stocks", "sectors"],
+            "treasury_bonds": ["corp_bonds"],
+            "corp_bonds": ["high_yield_bonds"]
+        }
+
+        for parent, children in parent_children.items():
+            if parent not in edges:
+                for child in children:
+                    if child in w_scaled:
+                        cash_sink += w_scaled[child]
+                        w_scaled.pop(child, None)
 
         # -----------------------------
         # Crypto cap
@@ -313,7 +401,7 @@ class ZephyrFivePillar(QCAlgorithm):
         return scores
 
     def GetDurationRegimeForGroup(self, closes, symbols):
-        if len(symbols) != 3:
+        if len(symbols) >= 2:
             return symbols
 
         def mom(s):
