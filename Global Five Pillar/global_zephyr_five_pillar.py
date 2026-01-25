@@ -2,85 +2,48 @@ from AlgorithmImports import *
 from typing import Dict, List
 import numpy as np
 import pandas as pd
-from collections import defaultdict
-
-
-# ====================================================
-# Sector-Neutral Large-Cap Universe
-# Top 20 stocks per sector by market cap
-# Modern Fundamental Universe (Python-safe)
-# ====================================================
-class SectorTop20UniverseSelectionModel(FundamentalUniverseSelectionModel):
-    def __init__(self):
-        super().__init__(self._select)
-
-    def _select(self, fundamentals):
-
-        sector_buckets = defaultdict(list)
-
-        for f in fundamentals:
-            if not f.has_fundamental_data:
-                continue
-
-            # Basic investability filters
-            if f.price is None or f.price <= 5:
-                continue
-            if f.market_cap is None or f.market_cap <= 0:
-                continue
-
-            # Sector classification
-            sector = f.asset_classification.morningstar_sector_code
-            if sector is None:
-                continue
-
-            # -----------------------------
-            # Quality filter: Positive Free Cash Flow
-            # -----------------------------
-            fcf = f.financial_statements.cash_flow_statement.free_cash_flow
-            if fcf is None or fcf.Value is None or fcf.Value <= 0:
-                continue
-
-            sector_buckets[sector].append(f)
-
-        selected = []
-
-        # Top 20 by market cap per sector
-        for sector, stocks in sector_buckets.items():
-            stocks.sort(key=lambda f: f.market_cap, reverse=True)
-            selected.extend(f.symbol for f in stocks[:20])
-
-        return selected
 
 
 class ZephyrFivePillar(QCAlgorithm):
+    """
+    Multi-asset, regime-aware allocation strategy using momentum,
+    trend filtering, win-rate confidence scaling, and volatility targeting.
 
-    def Initialize(self) -> None:
-        self.SetStartDate(2012, 1, 1)
-        self.SetCash(100_000)
+    Asset groups are scored independently and allocated dynamically,
+    with optional sector selection, SMA trend filters, and a
+    treasury-based kill switch.
+    """
+
+    def initialize(self) -> None:
+        """
+        Initialize the algorithm configuration, assets, indicators,
+        and scheduled rebalancing.
+        """
+        self.set_start_date(2012, 1, 1)
+        self.set_cash(100_000)
 
         # ============================
-        # User Options
+        # user options
         # ============================
         self.enable_sma_filter = True
-        self.winrate_lookback = 63
-        self.vol_lookback = 63
-        self.sma_period = 168
-        self.bond_sma_period = 126
-        self.stock_ema_period = 189
-        self.sector_count = 4
-        self.stock_count = 5
-        self.group_vol_target = 0.10
-        self.crypto_cap = 0.10
-
-        self.enable_stocks = True
         self.enable_sectors = True
-        self.enable_treasury_kill_switch = False
+        self.enable_treasury_kill_switch = True
+
+        self.winrate_lookback = 126
+        self.vol_lookback = 126
+
+        self.sma_period = 147
+        self.bond_sma_period = 126
+
+        self.sector_count = 2
+        self.group_vol_target = 0.20
+        self.crypto_cap = 0.10
 
         self.momentum_lookbacks = [21, 63, 126, 189, 252]
         self.max_lookback = max(self.momentum_lookbacks)
 
         # ============================
-        # Static Asset Groups
+        # asset groups
         # ============================
         self.group_tickers = {
             "real": ["GLD", "DBC"],
@@ -89,8 +52,8 @@ class ZephyrFivePillar(QCAlgorithm):
             "high_yield_bonds": ["SHYG", "HYG"],
             "equities": ["VTI", "VEA", "VWO"],
             "sectors": [
-                "IXP","RXI","KXI","IXC","IXG","IXJ",
-                "EXI","IXN","MXI","REET","JXI"
+                "IXP", "RXI", "KXI", "IXC", "IXG", "IXJ",
+                "EXI", "IXN", "MXI", "REET", "JXI"
             ],
             "crypto": ["BTCUSD", "ETHUSD"],
             "cash": ["BIL"]
@@ -98,37 +61,29 @@ class ZephyrFivePillar(QCAlgorithm):
 
         self.symbols: Dict[str, List[Symbol]] = {}
 
-        for g, tickers in self.group_tickers.items():
-            self.symbols[g] = []
-            for t in tickers:
-                if t in ["BTCUSD", "ETHUSD"]:
-                    sym = self.AddCrypto(t, Resolution.Daily).Symbol
-                else:
-                    sym = self.AddEquity(t, Resolution.Daily).Symbol
-                self.symbols[g].append(sym)
-                self.Securities[sym].FeeModel = ConstantFeeModel(0)
+        for group, tickers in self.group_tickers.items():
+            self.symbols[group] = []
+            for ticker in tickers:
+                symbol = (
+                    self.AddCrypto(ticker, Resolution.Daily).Symbol
+                    if ticker.endswith("USD")
+                    else self.AddEquity(ticker, Resolution.Daily).Symbol
+                )
+                self.symbols[group].append(symbol)
+                self.Securities[symbol].FeeModel = ConstantFeeModel(0)
 
-        self.all_symbols = [s for group in self.symbols.values() for s in group]
+        self.all_symbols = [s for v in self.symbols.values() for s in v]
 
         # ----------------------------
-        # Bond symbol set
+        # bond universe
         # ----------------------------
-        self.bond_symbols = set(
+        self.bond_symbols = {
             s for g in ["corp_bonds", "treasury_bonds", "high_yield_bonds"]
             for s in self.symbols[g]
-        )
+        }
 
         # ============================
-        # Universe
-        # ============================
-        self.UniverseSettings.Resolution = Resolution.Daily
-        self.UniverseSettings.DataNormalizationMode = DataNormalizationMode.TOTAL_RETURN
-        self.SetUniverseSelection(SectorTop20UniverseSelectionModel())
-
-        self.stock_symbols = set()
-
-        # ============================
-        # Indicators
+        # indicators
         # ============================
         self.smas = {
             s: self.SMA(s, self.sma_period, Resolution.Daily)
@@ -140,316 +95,317 @@ class ZephyrFivePillar(QCAlgorithm):
             for s in self.bond_symbols
         }
 
-        self.stock_emas: Dict[Symbol, IndicatorBase] = {}
-
         self.SetWarmUp(
-            max(self.winrate_lookback, self.vol_lookback,
-                self.max_lookback, self.stock_ema_period, self.bond_sma_period)
+            max(
+                self.winrate_lookback,
+                self.vol_lookback,
+                self.max_lookback,
+                self.bond_sma_period
+            )
         )
 
         self.Schedule.On(
             self.DateRules.MonthEnd(self.all_symbols[0]),
             self.TimeRules.BeforeMarketClose(self.all_symbols[0], 5),
-            self.Rebalance
+            self.rebalance
         )
 
     # ====================================================
-    # Dynamic universe tracking
+    # trend filter
     # ====================================================
-    def OnSecuritiesChanged(self, changes: SecurityChanges):
-        for security in changes.AddedSecurities:
-            if security.Symbol.SecurityType == SecurityType.Equity:
-                self.stock_symbols.add(security.Symbol)
+    def passes_trend(self, symbol: Symbol) -> bool:
+        """
+        Determine whether a symbol passes its SMA trend filter.
 
-                if security.Symbol not in self.stock_emas:
-                    self.stock_emas[security.Symbol] = self.EMA(
-                        security.Symbol,
-                        self.stock_ema_period,
-                        Resolution.Daily
-                    )
+        Parameters
+        ----------
+        symbol : Symbol
+            The asset symbol to evaluate.
 
-        for security in changes.RemovedSecurities:
-            self.stock_symbols.discard(security.Symbol)
-            self.stock_emas.pop(security.Symbol, None)
-
-    # ====================================================
-    # Trend logic
-    # ====================================================
-    def PassesTrend(self, symbol: Symbol) -> bool:
-
-        # Stocks → EMA
-        if symbol in self.stock_symbols:
-            ema = self.stock_emas.get(symbol)
-            return ema and ema.IsReady and self.Securities[symbol].Price > ema.Current.Value
-
-        # Bonds → bond SMA
-        if symbol in self.bond_symbols:
-            if not self.enable_sma_filter:
-                return True
-            sma = self.bond_smas.get(symbol)
-            return sma and sma.IsReady and self.Securities[symbol].Price > sma.Current.Value
-
-        # Everything else → default SMA
+        Returns
+        -------
+        bool
+            True if trend filtering is disabled or the asset price
+            is above its relevant SMA; False otherwise.
+        """
         if not self.enable_sma_filter:
             return True
-        sma = self.smas.get(symbol)
+
+        sma = (
+            self.bond_smas.get(symbol)
+            if symbol in self.bond_symbols
+            else self.smas.get(symbol)
+        )
+
         return sma and sma.IsReady and self.Securities[symbol].Price > sma.Current.Value
 
     # ====================================================
-    # Rebalance
+    # rebalance
     # ====================================================
-    def Rebalance(self) -> None:
+    def rebalance(self) -> None:
+        """
+        Monthly rebalance routine.
+
+        Computes momentum, win-rate confidence, volatility-adjusted
+        group weights, applies regime filters, and allocates capital
+        across asset groups with a cash fallback.
+        """
         if self.IsWarmingUp:
             return
 
         self.Liquidate()
 
-        all_hist_syms = list(set(self.all_symbols) | self.stock_symbols)
-
         history = self.history(
-            all_hist_syms,
+            self.all_symbols,
             self.max_lookback + 1,
             Resolution.Daily,
             data_normalization_mode=DataNormalizationMode.TOTAL_RETURN
         )
 
         closes = history["close"].unstack(0)
+        cash_symbol = self.symbols["cash"][0]
 
         # -----------------------------
-        # Duration regimes
+        # duration regimes
         # -----------------------------
-        corp_bond_syms = self.GetDurationRegimeForGroup(
+        corp_bonds = self.get_duration_regime_for_group(
             closes, self.symbols["corp_bonds"]
         )
-
-        treasury_bond_syms = self.GetDurationRegimeForGroup(
+        treasury_bonds = self.get_duration_regime_for_group(
             closes, self.symbols["treasury_bonds"]
         )
-
-        high_yield_bond_syms = self.GetDurationRegimeForGroup(
+        high_yield_bonds = self.get_duration_regime_for_group(
             closes, self.symbols["high_yield_bonds"]
         )
 
         # -----------------------------
-        # Sector momentum
+        # sector selection
         # -----------------------------
-        sector_mom = self.ComputeMomentum(self.symbols["sectors"], closes)
-        top_sectors = sorted(
-            sector_mom, key=sector_mom.get, reverse=True
-        )[:self.sector_count]
+        sector_symbols = []
+        if self.enable_sectors:
+            sector_momentum = self.compute_momentum(self.symbols["sectors"], closes)
+            sector_symbols = sorted(
+                sector_momentum,
+                key=sector_momentum.get,
+                reverse=True
+            )[:self.sector_count]
 
         # -----------------------------
-        # Nasdaq-100 Top 10
-        # -----------------------------
-        stock_mom = self.ComputeMomentum(list(self.stock_symbols), closes)
-        top_stocks = sorted(
-            stock_mom, key=stock_mom.get, reverse=True
-        )[:self.stock_count]
-
-        # -----------------------------
-        # Risk groups
+        # risk groups
         # -----------------------------
         risk_groups = {
             "real": self.symbols["real"],
-            "corp_bonds": corp_bond_syms,
-            "treasury_bonds": treasury_bond_syms,
-            "high_yield_bonds": high_yield_bond_syms,
+            "corp_bonds": corp_bonds,
+            "treasury_bonds": treasury_bonds,
+            "high_yield_bonds": high_yield_bonds,
             "equities": self.symbols["equities"],
             "crypto": self.symbols["crypto"]
         }
 
-        if self.enable_sectors:
-            risk_groups["sectors"] = top_sectors
+        if sector_symbols:
+            risk_groups["sectors"] = sector_symbols
 
-        if self.enable_stocks:
-            risk_groups["stocks"] = top_stocks
+        edges = {}
+        vols = {}
 
-        edges, vols = {}, {}
-
-        for g, syms in risk_groups.items():
+        # -----------------------------
+        # group scoring
+        # -----------------------------
+        for group, symbols in risk_groups.items():
             eligible = [
-                s for s in syms
-                if s in closes.columns and self.PassesTrend(s)
+                s for s in symbols
+                if s in closes.columns and self.passes_trend(s)
             ]
             if not eligible:
                 continue
 
-            g_rets = closes[eligible].pct_change().mean(axis=1).dropna()
-            if len(g_rets) < self.winrate_lookback:
+            group_returns = closes[eligible].pct_change().mean(axis=1).dropna()
+            if len(group_returns) < self.winrate_lookback:
                 continue
 
-            p_win = float(np.mean(g_rets.tail(self.winrate_lookback) > 0))
-            # ------------------------------------------------
-            # Data-driven magnitude (signal-to-noise confidence)
-            # ------------------------------------------------
-            group_mom = self.ComputeGroupMomentum(eligible, closes)
+            group_momentum = self.compute_group_momentum(eligible, closes)
+            win_rate = float(np.mean(group_returns.tail(self.winrate_lookback) > 0))
+            vol_std = float(np.std(group_returns.tail(self.vol_lookback)))
 
-            # Noise estimate from recent group returns
-            mom_std = float(np.std(g_rets.tail(self.vol_lookback)))
+            confidence = np.clip(
+                abs(group_momentum) / (vol_std + 1e-6),
+                0.0,
+                2.0
+            )
+            scale = max(0.1, 1.0 + confidence * np.sign(group_momentum))
+            edge = win_rate * scale
 
-            # Signal-to-noise confidence
-            confidence = abs(group_mom) / (mom_std + 1e-6)
-            confidence = np.clip(confidence, 0.0, 2.0)
-
-            # Conviction scaling (never vetoes participation)
-            scale = max(0.1, 1.0 + confidence * np.sign(group_mom))
-
-            edge = p_win * scale
-
-            g_vol = float(np.std(np.log1p(g_rets.tail(self.vol_lookback))) * np.sqrt(252))
-            if g_vol <= 0:
+            group_vol = float(
+                np.std(np.log1p(group_returns.tail(self.vol_lookback))) * np.sqrt(252)
+            )
+            if group_vol <= 0:
                 continue
 
-            edges[g] = edge
-            vols[g] = g_vol
+            edges[group] = edge
+            vols[group] = group_vol
 
         if not edges:
-            self.SetHoldings(self.symbols["cash"][0], 1.0)
+            self.SetHoldings(cash_symbol, 1.0)
             return
-        # ------------------------------------------------
-        # Treasury kill switch
-        # ------------------------------------------------
+
+        # -----------------------------
+        # treasury kill switch
+        # -----------------------------
         if self.enable_treasury_kill_switch and "treasury_bonds" not in edges:
-            self.Debug(
-                f"{self.Time.date()} | TREASURY KILL SWITCH → ALL CASH"
-            )
-            self.SetHoldings(self.symbols["cash"][0], 1.0)
+            self.SetHoldings(cash_symbol, 1.0)
+            self.Debug(f"{self.Time.date()} | treasury kill switch → cash")
             return
 
         # -----------------------------
-        # Normalize + vol targeting
+        # normalize + vol targeting
         # -----------------------------
-        edge_eff = {g: e + 0.01 for g, e in edges.items()}
-        total_edge = sum(edge_eff.values())
-        w_raw = {g: e / total_edge for g, e in edge_eff.items()}
+        effective_edges = {g: e + 0.01 for g, e in edges.items()}
+        total_edge = sum(effective_edges.values())
 
-        w_scaled = {
-            g: w * min(1.0, self.group_vol_target / vols[g])
-            for g, w in w_raw.items()
+        weights = {
+            g: (effective_edges[g] / total_edge)
+            * min(1.0, self.group_vol_target / vols[g])
+            for g in effective_edges
         }
 
         # -----------------------------
-        # Hierarchical gating with cash handling
+        # crypto cap
         # -----------------------------
-        cash_sink = 0.0
-
-        parent_children = {
-            "equities": ["stocks", "sectors"],
-            "treasury_bonds": ["corp_bonds"],
-            "corp_bonds": ["high_yield_bonds"]
-        }
-
-        for parent, children in parent_children.items():
-            if parent not in edges:
-                for child in children:
-                    if child in w_scaled:
-                        cash_sink += w_scaled[child]
-                        w_scaled.pop(child, None)
-
-        # -----------------------------
-        # Crypto cap
-        # -----------------------------
-        if "crypto" in w_scaled and w_scaled["crypto"] > self.crypto_cap:
-            excess = w_scaled["crypto"] - self.crypto_cap
-            w_scaled["crypto"] = self.crypto_cap
-            others = [g for g in w_scaled if g != "crypto"]
-            total_other = sum(w_scaled[g] for g in others)
+        if "crypto" in weights and weights["crypto"] > self.crypto_cap:
+            excess = weights["crypto"] - self.crypto_cap
+            weights["crypto"] = self.crypto_cap
+            others = [g for g in weights if g != "crypto"]
+            total_other = sum(weights[g] for g in others)
             for g in others:
-                w_scaled[g] += excess * (w_scaled[g] / total_other)
+                weights[g] += excess * (weights[g] / total_other)
 
-        risk_weight = sum(w_scaled.values())
+        risk_weight = sum(weights.values())
         cash_weight = max(0.0, 1.0 - risk_weight)
 
         # -----------------------------
-        # Allocate
+        # allocate
         # -----------------------------
-        for g, wg in w_scaled.items():
-            syms = [s for s in risk_groups[g] if self.PassesTrend(s)]
-            if not syms:
+        for group, group_weight in weights.items():
+            symbols = [
+                s for s in risk_groups[group]
+                if self.passes_trend(s)
+            ]
+            if not symbols:
                 continue
 
-            alloc = wg / len(syms)
-            for s in syms:
-                self.SetHoldings(s, alloc)
+            alloc = group_weight / len(symbols)
+            for symbol in symbols:
+                self.SetHoldings(symbol, alloc)
 
-        self.SetHoldings(self.symbols["cash"][0], cash_weight)
+        self.set_holdings(cash_symbol, cash_weight)
 
-        # -----------------------------
-        # DEBUG PRINT (RESTORED)
-        # -----------------------------
         self.Debug(
-            f"{self.Time.date()} | risk={round(risk_weight,3)} "
-            f"cash={round(cash_weight,3)} | "
-            + ", ".join(f"{g}:{round(w,3)}" for g, w in w_scaled.items())
+            f"{self.Time.date()} | risk={risk_weight:.3f} cash={cash_weight:.3f} | "
+            + ", ".join(f"{g}:{w:.3f}" for g, w in weights.items())
         )
 
     # ====================================================
-    # Helpers
+    # helpers
     # ====================================================
-    def ComputeMomentum(self, symbols, closes):
+    def compute_momentum(self, symbols, closes):
+        """
+        Compute multi-horizon momentum scores for individual symbols.
+
+        Parameters
+        ----------
+        symbols : list[Symbol]
+            Symbols to score.
+        closes : pd.DataFrame
+            DataFrame of adjusted close prices indexed by time.
+
+        Returns
+        -------
+        dict
+            Mapping of Symbol to average compounded return across
+            predefined lookback windows.
+        """
         scores = {}
-        for s in symbols:
-            if s not in closes.columns:
+        for symbol in symbols:
+            if symbol not in closes.columns:
                 continue
-            px = closes[s]
-            if len(px) < self.max_lookback + 1:
+            prices = closes[symbol]
+            if len(prices) < self.max_lookback + 1:
                 continue
-            scores[s] = float(np.mean([
-                px.iloc[-1] / px.iloc[-(lb + 1)] - 1
+            scores[symbol] = float(np.mean([
+                prices.iloc[-1] / prices.iloc[-(lb + 1)] - 1
                 for lb in self.momentum_lookbacks
             ]))
         return scores
 
-    def GetDurationRegimeForGroup(self, closes, symbols):
+    def get_duration_regime_for_group(self, closes, symbols):
+        """
+        Select bond duration exposure based on relative momentum.
 
-        def mom(s):
-            if s not in closes.columns:
+        Parameters
+        ----------
+        closes : pd.DataFrame
+            Adjusted close price history.
+        symbols : list[Symbol]
+            Ordered list of bond symbols from shortest to longest duration.
+
+        Returns
+        -------
+        list[Symbol]
+            Subset of symbols representing the active duration regime.
+        """
+        def momentum(symbol):
+            if symbol not in closes.columns or len(closes[symbol]) < 127:
                 return -np.inf
-            px = closes[s]
-            if len(px) < 127:
-                return -np.inf
+            prices = closes[symbol]
             return np.mean([
-                px.iloc[-1] / px.iloc[-21] - 1,
-                px.iloc[-1] / px.iloc[-63] - 1,
-                px.iloc[-1] / px.iloc[-126] - 1,
+                prices.iloc[-1] / prices.iloc[-21] - 1,
+                prices.iloc[-1] / prices.iloc[-63] - 1,
+                prices.iloc[-1] / prices.iloc[-126] - 1,
             ])
 
-        # -----------------------------
-        # 3-asset duration ladder
-        # -----------------------------
         if len(symbols) == 3:
-            s, i, l = symbols
+            short, intermediate, long = symbols
             return (
-                [s, i, l] if mom(l) > mom(i) > mom(s)
-                else [s, i] if mom(i) > mom(s)
-                else [s]
+                [short, intermediate, long]
+                if momentum(long) > momentum(intermediate) > momentum(short)
+                else [short, intermediate]
+                if momentum(intermediate) > momentum(short)
+                else [short]
             )
 
-        # -----------------------------
-        # 2-asset ladder (HY case)
-        # -----------------------------
         if len(symbols) == 2:
-            s, l = symbols
-            return [s, l] if mom(l) > mom(s) else [s]
+            short, long = symbols
+            return [short, long] if momentum(long) > momentum(short) else [short]
 
-        # -----------------------------
-        # Fallback (single asset)
-        # -----------------------------
         return symbols
 
-    def ComputeGroupMomentum(self, symbols, closes):
-        moms = []
-        for s in symbols:
-            if s not in closes.columns:
+    def compute_group_momentum(self, symbols, closes):
+        """
+        Compute aggregate momentum for a group of symbols.
+
+        Parameters
+        ----------
+        symbols : list[Symbol]
+            Symbols in the group.
+        closes : pd.DataFrame
+            Adjusted close price history.
+
+        Returns
+        -------
+        float
+            Mean multi-horizon momentum across all eligible symbols
+            in the group.
+        """
+        values = []
+        for symbol in symbols:
+            if symbol not in closes.columns or len(closes[symbol]) < 253:
                 continue
-            px = closes[s]
-            if len(px) < 253:
-                continue
-            moms.append(np.mean([
-                px.iloc[-1] / px.iloc[-21] - 1,
-                px.iloc[-1] / px.iloc[-63] - 1,
-                px.iloc[-1] / px.iloc[-126] - 1,
-                px.iloc[-1] / px.iloc[-189] - 1,
-                px.iloc[-1] / px.iloc[-252] - 1,
+            prices = closes[symbol]
+            values.append(np.mean([
+                prices.iloc[-1] / prices.iloc[-21] - 1,
+                prices.iloc[-1] / prices.iloc[-63] - 1,
+                prices.iloc[-1] / prices.iloc[-126] - 1,
+                prices.iloc[-1] / prices.iloc[-189] - 1,
+                prices.iloc[-1] / prices.iloc[-252] - 1,
             ]))
-        return float(np.mean(moms)) if moms else 0.0
+        return float(np.mean(values)) if values else 0.0
