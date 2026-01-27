@@ -5,7 +5,7 @@ import yfinance as yf
 # ============================
 # USER CONFIG (MATCHES QC)
 # ============================
-GROUP_VOL_TARGET = 0.20
+GROUP_VOL_TARGET = 0.50
 CRYPTO_CAP = 0.10
 
 ENABLE_SMA_FILTER = True
@@ -145,37 +145,51 @@ if ENABLE_SECTORS:
 # EDGE + VOL (QC EXACT)
 # ============================
 edges, vols = {}, {}
+group_assets = {}
 
 for group, symbols in risk_groups.items():
-    eligible = [s for s in symbols if s in data and passes_trend(s)]
+    eligible = []
+
+    for s in symbols:
+        if s not in data:
+            continue
+        if not passes_trend(s):
+            continue
+        if momentum(s) <= 0:
+            continue
+        eligible.append(s)
+
     if not eligible:
         continue
 
-    rets = data[eligible].pct_change().mean(axis=1).dropna()
-    if len(rets) < WINRATE_LOOKBACK:
+    group_assets[group] = eligible
+
+    simple_rets = data[eligible].pct_change().mean(axis=1).dropna()
+    if len(simple_rets) < max(WINRATE_LOOKBACK, VOL_LOOKBACK):
         continue
 
-    win_rate = (rets.tail(WINRATE_LOOKBACK) > 0).mean()
+    log_rets = np.log1p(simple_rets)
+
     mom = group_momentum(eligible)
-    noise = rets.tail(VOL_LOOKBACK).std()
 
-    confidence = np.clip(abs(mom) / (noise + 1e-6), 0.0, 2.0)
-    scale = max(0.1, 1.0 + confidence * np.sign(mom))
-    edge = win_rate * scale
+    win_rate = (log_rets.tail(WINRATE_LOOKBACK) > 0).mean()
 
-    vol = np.std(np.log1p(rets.tail(VOL_LOOKBACK))) * np.sqrt(252)
-    if vol <= 0:
+    vol = np.std(log_rets.tail(VOL_LOOKBACK)) * np.sqrt(252)
+    if not np.isfinite(vol) or vol <= 0:
         continue
 
-    edges[group] = edge
+    confidence = np.clip(abs(mom) / (vol + 1e-6), 0.0, 2.0)
+    scale = max(0.1, 1.0 + confidence * np.sign(mom))
+
+    edges[group] = win_rate * scale
     vols[group] = vol
 
 # ============================
 # TREASURY KILL SWITCH
 # ============================
 if ENABLE_TREASURY_KILL_SWITCH and "treasury_bonds" not in edges:
-    print("Treasury kill switch → 100% cash")
     pd.Series({"BIL": 1.0}, name="weight").to_csv("signals.csv")
+    print("Treasury kill switch → 100% cash")
     exit()
 
 # ============================
@@ -204,12 +218,12 @@ if "crypto" in weights and weights["crypto"] > CRYPTO_CAP:
 cash_weight = max(0.0, 1.0 - sum(weights.values()))
 
 # ============================
-# FINAL ALLOCATION
+# FINAL ALLOCATION (QC EXACT)
 # ============================
 allocations = {}
 
 for group, w in weights.items():
-    symbols = [s for s in risk_groups[group] if passes_trend(s)]
+    symbols = group_assets.get(group, [])
     if not symbols:
         continue
     for s in symbols:
@@ -222,10 +236,8 @@ out = (
     .sort_values(ascending=False)
     .to_frame("weight")
 )
-out_pct = out * 100
-out_pct.columns = ["weight_pct"]
 
-out_pct.to_csv("signals_pct.csv")
+(out * 100).rename(columns={"weight": "weight_pct"}).to_csv("signals_pct.csv")
 
 print("\nFINAL SIGNALS (%)\n")
-print(out_pct.round(2))
+print((out * 100).round(2))

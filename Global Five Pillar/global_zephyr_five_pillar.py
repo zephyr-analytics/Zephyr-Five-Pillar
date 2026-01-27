@@ -36,7 +36,7 @@ class ZephyrFivePillar(QCAlgorithm):
         self.bond_sma_period = 126
 
         self.sector_count = 2
-        self.group_vol_target = 0.20
+        self.group_vol_target = 0.12
         self.crypto_cap = 0.10
 
         self.momentum_lookbacks = [21, 63, 126, 189, 252]
@@ -207,39 +207,63 @@ class ZephyrFivePillar(QCAlgorithm):
 
         edges = {}
         vols = {}
+        group_assets = {}
 
         # -----------------------------
         # group scoring
         # -----------------------------
         for group, symbols in risk_groups.items():
-            eligible = [
-                s for s in symbols
-                if s in closes.columns and self.passes_trend(s)
-            ]
+            eligible = []
+            for s in symbols:
+                if s not in closes.columns:
+                    continue
+                if not self.passes_trend(s):
+                    continue
+
+                asset_momentum = self.compute_asset_momentum(s, closes)
+                if asset_momentum <= 0:
+                    continue
+
+                eligible.append(s)
+
             if not eligible:
                 continue
 
-            group_returns = closes[eligible].pct_change().mean(axis=1).dropna()
-            if len(group_returns) < self.winrate_lookback:
+            group_assets[group] = eligible
+
+            # group aggregate returns (equal-weighted basket)
+            group_simple_returns = closes[eligible].pct_change().mean(axis=1).dropna()
+            if len(group_simple_returns) < max(self.winrate_lookback, self.vol_lookback):
                 continue
 
-            group_momentum = self.compute_group_momentum(eligible, closes)
-            win_rate = float(np.mean(group_returns.tail(self.winrate_lookback) > 0))
-            vol_std = float(np.std(group_returns.tail(self.vol_lookback)))
+            # use log returns consistently
+            group_log_returns = np.log1p(group_simple_returns)
 
+            # group momentum (unchanged definition)
+            group_momentum = self.compute_group_momentum(eligible, closes)
+
+            # win rate computed on same return series
+            win_rate = float(
+                np.mean(group_log_returns.tail(self.winrate_lookback) > 0)
+            )
+
+            # unified annualized volatility
+            group_vol = float(
+                np.std(group_log_returns.tail(self.vol_lookback)) * np.sqrt(252)
+            )
+
+            if not np.isfinite(group_vol) or group_vol <= 0:
+                continue
+
+            # confidence uses SAME vol
             confidence = np.clip(
-                abs(group_momentum) / (vol_std + 1e-6),
+                abs(group_momentum) / (group_vol + 1e-6),
                 0.0,
                 2.0
             )
+
             scale = max(0.1, 1.0 + confidence * np.sign(group_momentum))
             edge = win_rate * scale
-
-            group_vol = float(
-                np.std(np.log1p(group_returns.tail(self.vol_lookback))) * np.sqrt(252)
-            )
-            if group_vol <= 0:
-                continue
 
             edges[group] = edge
             vols[group] = group_vol
@@ -286,10 +310,7 @@ class ZephyrFivePillar(QCAlgorithm):
         # allocate
         # -----------------------------
         for group, group_weight in weights.items():
-            symbols = [
-                s for s in risk_groups[group]
-                if self.passes_trend(s)
-            ]
+            symbols = group_assets.get(group, [])
             if not symbols:
                 continue
 
@@ -297,7 +318,7 @@ class ZephyrFivePillar(QCAlgorithm):
             for symbol in symbols:
                 self.SetHoldings(symbol, alloc)
 
-        self.set_holdings(cash_symbol, cash_weight)
+        self.SetHoldings(cash_symbol, cash_weight)
 
         self.Debug(
             f"{self.Time.date()} | risk={risk_weight:.3f} cash={cash_weight:.3f} | "
@@ -409,3 +430,20 @@ class ZephyrFivePillar(QCAlgorithm):
                 prices.iloc[-1] / prices.iloc[-252] - 1,
             ]))
         return float(np.mean(values)) if values else 0.0
+
+    def compute_asset_momentum(self, symbol, closes) -> float:
+        """
+        Compute multi-horizon momentum for a single asset.
+
+        Returns the average compounded return across
+        self.momentum_lookbacks.
+        """
+        if symbol not in closes.columns or len(closes[symbol]) < self.max_lookback + 1:
+            return -np.inf
+
+        prices = closes[symbol]
+
+        return float(np.mean([
+            prices.iloc[-1] / prices.iloc[-(lb + 1)] - 1
+            for lb in self.momentum_lookbacks
+        ]))
