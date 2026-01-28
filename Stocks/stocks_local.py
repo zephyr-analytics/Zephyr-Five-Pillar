@@ -14,8 +14,8 @@ MAX_WEIGHT = 0.25
 
 CORR_LOOKBACK = 21
 CORR_KILL_THRESHOLD = 0.65
-CORR_FLOOR = 0.25
-CORR_CEILING = 0.45
+CORR_FLOOR = 0.45
+CORR_CEILING = 0.40
 
 STOCKS_CSV = "stocks.csv"
 
@@ -41,12 +41,24 @@ def avg_pairwise_corr(returns):
 def corr_scaler(avg_corr):
     if avg_corr is None:
         return 1.0
-    if avg_corr <= CORR_FLOOR:
+
+    safe = CORR_FLOOR      # e.g. 0.40–0.45
+    danger = CORR_CEILING  # e.g. 0.50–0.55
+    min_scale = 0.25
+
+    # Full exposure in safe zone
+    if avg_corr <= safe:
         return 1.0
-    if avg_corr >= CORR_CEILING:
-        return 0.25
-    scale = 1.0 - (avg_corr - CORR_FLOOR) / (CORR_CEILING - CORR_FLOOR)
-    return max(0.25, scale)
+
+    # Minimum exposure in danger zone
+    if avg_corr >= danger:
+        return min_scale
+
+    # Fast convex decay between safe and danger
+    x = (avg_corr - safe) / (danger - safe)
+    scale = 1.0 - x * x   # convex penalty
+
+    return max(min_scale, scale)
 
 def chunked(seq, size):
     for i in range(0, len(seq), size):

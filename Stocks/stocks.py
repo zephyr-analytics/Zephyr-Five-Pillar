@@ -53,8 +53,8 @@ class SectorTopUniverse(FundamentalUniverseSelectionModel):
 class StockOnlyMomentum(QCAlgorithm):
 
     def Initialize(self):
-        self.SetStartDate(2010, 1, 1)
-        self.SetCash(100_000)
+        self.SetStartDate(2004, 1, 1)
+        self.SetCash(1_000_000)
 
         # -----------------------------
         # Strategy parameters
@@ -65,18 +65,23 @@ class StockOnlyMomentum(QCAlgorithm):
         self.max_lookback = max(self.momentum_lookbacks)
 
         self.max_weight = 0.25
-        self.max_leverage = 1.0
         self.use_vol_scaling = True
 
         # Correlation controls
         self.corr_lookback = 21
         self.corr_kill_threshold = float(self.get_parameter("corr_threshold"))
+        self.corr_kill_threshold = 0.60
 
-        # Correlation scaler band
-        self.corr_floor = float(self.get_parameter("corr_floor"))
-        self.corr_ceiling = float(self.get_parameter("corr_ceiling"))
+        # Rolling correlation scaling
+        self.corr_z_lookback = 63
+        self.corr_history = []
+        self.min_scale = 0.10
+        self.corr_k = 1.5
 
-        # Risk state
+        # Hysteresis / slow re-risking
+        self.current_scale = 1.0
+        self.scale_recovery_months = 3
+
         self.kill_switch_active = False
 
         # -----------------------------
@@ -91,14 +96,12 @@ class StockOnlyMomentum(QCAlgorithm):
 
         self.SetWarmUp(self.max_lookback + self.ema_period)
 
-        # Monthly rebalance
         self.Schedule.On(
             self.DateRules.MonthEnd(),
             self.TimeRules.BeforeMarketClose("SPY", 5),
             self.Rebalance
         )
 
-        # Daily kill switch
         self.Schedule.On(
             self.DateRules.EveryDay("SPY"),
             self.TimeRules.BeforeMarketClose("SPY", 5),
@@ -126,7 +129,7 @@ class StockOnlyMomentum(QCAlgorithm):
 
             self.Debug(
                 f"{self.Time.date()} | CORR KILL | "
-                f"AvgCorr={avg_corr:.2f} → CASH (until rebalance)"
+                f"AvgCorr={avg_corr:.2f} → CASH"
             )
 
     # ------------------------------------------------
@@ -153,12 +156,6 @@ class StockOnlyMomentum(QCAlgorithm):
     def Rebalance(self):
         if self.IsWarmingUp:
             return
-        if self.kill_switch_active:
-            self.Debug(
-                f"{self.Time.date()} | REBALANCE WINDOW | "
-                f"Kill switch reset"
-            )
-            self.kill_switch_active = False
 
         history = self.history(
             list(self.stock_symbols),
@@ -205,49 +202,121 @@ class StockOnlyMomentum(QCAlgorithm):
 
         top = sorted(scores, key=scores.get, reverse=True)[:self.stock_count]
 
-        # -----------------------------
-        # Correlation-based scaling
-        # -----------------------------
+        # ------------------------------------------------
+        # Correlation (single evaluation)
+        # ------------------------------------------------
         avg_corr = self.ComputeAverageCorrelation(top)
-        vol_scale = self.ComputeCorrScaler(avg_corr)
 
+        if avg_corr is not None and np.isfinite(avg_corr):
+            self.corr_history.append(avg_corr)
+            if len(self.corr_history) > self.corr_z_lookback:
+                self.corr_history.pop(0)
+
+        # ------------------------------------------------
+        # Kill switch check
+        # ------------------------------------------------
+        if self.kill_switch_active:
+            if avg_corr is None or avg_corr >= self.corr_kill_threshold:
+                self.Debug(
+                    f"{self.Time.date()} | REBALANCE SKIPPED | "
+                    f"Kill switch ACTIVE | AvgCorr={avg_corr}"
+                )
+                return
+
+            self.Debug(
+                f"{self.Time.date()} | REBALANCE RESUME | "
+                f"Kill switch CLEARED | AvgCorr={avg_corr:.2f}"
+            )
+            self.kill_switch_active = False
+
+        # ------------------------------------------------
+        # Correlation-based scaling with hysteresis
+        # ------------------------------------------------
+        target_scale = self.ComputeCorrScaler(avg_corr)
+
+        if target_scale < self.current_scale:
+            self.current_scale = target_scale
+        else:
+            alpha = 1.0 / self.scale_recovery_months
+            self.current_scale += alpha * (target_scale - self.current_scale)
+
+        vol_scale = self.current_scale
+
+        self.Debug(
+            f"{self.Time.date()} | SCALE | "
+            f"AvgCorr={avg_corr:.3f} "
+            f"Target={target_scale:.2f} "
+            f"Current={vol_scale:.2f}"
+        )
+
+        # ------------------------------------------------
         # Raw momentum weights
+        # ------------------------------------------------
         raw = {s: scores[s] for s in top}
-        total = sum(raw.values())
-        base_weights = {s: raw[s] / total for s in raw}
+        clean = {s: w for s, w in raw.items() if np.isfinite(w) and w > 0}
 
-        # -----------------------------
-        # Apply 20% cap with redistribution
-        # -----------------------------
-        capped = base_weights.copy()
-        excess = 0.0
+        total = sum(clean.values())
+        if total <= 0:
+            self.Debug(
+                f"{self.Time.date()} | ALL MOMENTUM INVALID — DETAILS: " +
+                ", ".join(f"{s.Value}:{raw[s]}" for s in raw)
+            )
+            return
 
-        for s, w in capped.items():
-            if w > self.max_weight:
-                excess += w - self.max_weight
-                capped[s] = self.max_weight
+        base_weights = {s: w / total for s, w in clean.items()}
 
-        if excess > 0:
-            uncapped = {s: w for s, w in capped.items() if w < self.max_weight}
-            uncapped_total = sum(uncapped.values())
-            if uncapped_total > 0:
-                for s in uncapped:
-                    capped[s] += excess * (uncapped[s] / uncapped_total)
+        # ------------------------------------------------
+        # Iterative cap with redistribution
+        # ------------------------------------------------
+        weights = base_weights.copy()
 
-        # Final scaled weights
-        final_weights = {s: w * vol_scale for s, w in capped.items()}
+        while True:
+            excess = 0.0
+            free = {}
 
-        # -----------------------------
+            for s, w in weights.items():
+                if w > self.max_weight:
+                    excess += w - self.max_weight
+                    weights[s] = self.max_weight
+                else:
+                    free[s] = w
+
+            if excess <= 1e-8 or not free:
+                break
+
+            free_total = sum(free.values())
+            redistributed = False
+
+            for s in free:
+                add = excess * (free[s] / free_total)
+                new_w = weights[s] + add
+                if new_w > self.max_weight:
+                    weights[s] = self.max_weight
+                    redistributed = True
+                else:
+                    weights[s] = new_w
+
+            if not redistributed:
+                break
+
+        total = sum(weights.values())
+        if total > 0:
+            for s in weights:
+                weights[s] /= total
+
+        final_weights = {s: w * vol_scale for s, w in weights.items()}
+
+        # ------------------------------------------------
         # Execute trades
-        # -----------------------------
+        # ------------------------------------------------
         self.Liquidate()
         for s, w in final_weights.items():
             if w > 0:
                 self.SetHoldings(s, w)
 
-        # -----------------------------
+        # ------------------------------------------------
         # Debug output (FULL VISIBILITY)
-        # -----------------------------
+        # ------------------------------------------------
         total_alloc = sum(final_weights.values())
         cash_weight = max(0.0, 1.0 - total_alloc)
 
@@ -257,10 +326,11 @@ class StockOnlyMomentum(QCAlgorithm):
 
         self.Debug(
             f"{self.Time.date()} | n={len(final_weights)} | "
-            f"AvgCorr={avg_corr:.2f} | Scale={vol_scale:.2f} | "
-            f"CASH:{cash_weight:.2%} | {weights_str}"
+            f"AvgCorr={avg_corr:.2f} | "
+            f"Scale={vol_scale:.2f} | "
+            f"CASH:{cash_weight:.2%} | "
+            f"{weights_str}"
         )
-
 
     # ------------------------------------------------
     # Correlation helpers
@@ -294,14 +364,21 @@ class StockOnlyMomentum(QCAlgorithm):
         if not self.use_vol_scaling or avg_corr is None:
             return 1.0
 
-        if avg_corr <= self.corr_floor:
-            scale = 1.0
-        elif avg_corr >= self.corr_ceiling:
-            scale = 0.25
-        else:
-            scale = 1.0 - (avg_corr - self.corr_floor) / (
-                self.corr_ceiling - self.corr_floor
-            )
-            scale = max(0.25, scale)
+        if len(self.corr_history) < 5:
+            return 1.0
 
-        return min(self.max_leverage, scale)
+        mu = np.mean(self.corr_history)
+        sigma = np.std(self.corr_history)
+
+        if sigma <= 1e-6:
+            return 1.0
+
+        z = max(0.0, (avg_corr - mu) / sigma)
+        scale = self.min_scale + (1.0 - self.min_scale) * np.exp(-self.corr_k * z)
+
+        self.Debug(
+            f"{self.Time.date()} | CORR Z | "
+            f"μ={mu:.3f} σ={sigma:.3f} z={z:.2f} scale={scale:.2f}"
+        )
+
+        return scale
