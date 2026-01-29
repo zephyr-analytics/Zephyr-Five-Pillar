@@ -10,14 +10,17 @@ EMA_PERIOD = 210
 MOMENTUM_LOOKBACKS = [21, 63, 126, 189, 252]
 MAX_LOOKBACK = max(MOMENTUM_LOOKBACKS)
 
+WINRATE_LOOKBACK = 126
+VOL_LOOKBACK = 126
+
 MAX_WEIGHT = 0.25
 
 CORR_LOOKBACK = 21
 CORR_KILL_THRESHOLD = 0.60
 
 # QC correlation scaling
-CORR_Z_LOOKBACK = 63
-MIN_SCALE = 0.25
+CORR_Z_LOOKBACK = 126
+MIN_SCALE = 0.30
 CORR_K = 1.5
 SCALE_RECOVERY_MONTHS = 6
 
@@ -48,15 +51,12 @@ def compute_avg_corr_from_prices(prices_df, symbols, end_idx, lookback):
     if len(syms) < 2:
         return None
 
-    # Need lookback+1 closes to form lookback returns
     start = end_idx - (lookback + 1)
     if start < 0:
         return None
 
     window = prices_df.iloc[start:end_idx + 1][syms]
     rets = window.pct_change(fill_method=None).dropna()
-    # If any symbol missing within the window, QC history() often drops it implicitly;
-    # mimic by dropping columns with any NaNs in the return window.
     rets = rets.dropna(axis=1)
     if rets.shape[1] < 2:
         return None
@@ -119,6 +119,28 @@ def chunked(seq, size):
         yield seq[i:i + size]
 
 # =============================
+# QC PER-ASSET EDGE (ADDED)
+# =============================
+def compute_edge(px, momentum):
+    simple_returns = px.pct_change().dropna()
+    log_returns = np.log1p(simple_returns)
+
+    if len(log_returns) < max(WINRATE_LOOKBACK, VOL_LOOKBACK):
+        return None
+
+    win_rate = float(np.mean(log_returns.tail(WINRATE_LOOKBACK) > 0))
+
+    vol = float(np.std(log_returns.tail(VOL_LOOKBACK)) * np.sqrt(252))
+    if not np.isfinite(vol) or vol <= 0:
+        return None
+
+    confidence = np.clip(abs(momentum) / (vol + 1e-6), 0.0, 2.0)
+    scale = max(0.1, 1.0 + confidence * np.sign(momentum))
+
+    edge = win_rate * scale
+    return edge if np.isfinite(edge) and edge > 0 else None
+
+# =============================
 # LOAD UNIVERSE
 # =============================
 symbols = pd.read_csv(STOCKS_CSV)["Symbol"].astype(str).str.upper().tolist()
@@ -145,10 +167,8 @@ prices = fetch_adj_close(symbols)
 if prices.empty:
     raise SystemExit("No price data downloaded.")
 
-# Keep only universe symbols that actually downloaded
 prices = prices.loc[:, [c for c in prices.columns if c in set(symbols)]]
 
-# Precompute EMA for each symbol (QC EMA indicator updated daily; this is equivalent on daily closes)
 ema_df = prices.apply(lambda s: ema(s, EMA_PERIOD))
 
 # =============================
@@ -158,51 +178,45 @@ corr_history = []
 kill_switch_active = False
 current_scale = 1.0
 
-holdings = {}  # symbol -> weight (post-scale)
-hold_syms = [] # invested symbols list, for DailyRiskCheck correlations
+holdings = {}
+hold_syms = []
 
-# define month-end trading days (QC DateRules.MonthEnd() on trading calendar)
 dates = prices.index
 month_end_dates = dates.to_series().groupby([dates.year, dates.month]).max().values
 month_end_set = set(month_end_dates)
 
-# Need enough data to support BOTH EMA and momentum lookbacks (QC warmup: max_lookback + ema_period)
-min_bars = MAX_LOOKBACK + EMA_PERIOD + 5  # small cushion
+min_bars = MAX_LOOKBACK + EMA_PERIOD + 5
 
 for t_i, dt in enumerate(dates):
     if t_i < min_bars:
         continue
 
     # -------------------------
-    # DailyRiskCheck (QC)
+    # DailyRiskCheck
     # -------------------------
     if not kill_switch_active and len(hold_syms) >= 2:
         avg_corr_inv = compute_avg_corr_from_prices(prices, hold_syms, t_i, CORR_LOOKBACK)
         if avg_corr_inv is not None and avg_corr_inv >= CORR_KILL_THRESHOLD:
-            # QC: Liquidate() and set kill switch
             holdings = {}
             hold_syms = []
             kill_switch_active = True
 
     # -------------------------
-    # Monthly Rebalance (QC)
+    # Monthly Rebalance
     # -------------------------
     if dt not in month_end_set:
         continue
 
-    # Build eligible scores exactly like QC Rebalance
     scores = {}
-    # QC history(list(self.stock_symbols), max_lookback+1) then per-symbol checks
+
     for s in prices.columns:
         px = prices[s].iloc[:t_i + 1]
         if px.isna().iloc[-1]:
             continue
 
-        # Need max_lookback+1 prices up to dt
         if len(px.dropna()) < MAX_LOOKBACK + 1:
             continue
 
-        # momentum on last max_lookback+1 prices
         tail_px = px.dropna().iloc[-(MAX_LOOKBACK + 1):]
         if len(tail_px) < MAX_LOOKBACK + 1:
             continue
@@ -211,42 +225,32 @@ for t_i, dt in enumerate(dates):
         if not np.isfinite(mom) or mom <= 0:
             continue
 
-        # EMA ready equivalent: if EMA is NaN at dt, skip
         ema_val = ema_df[s].iloc[t_i]
         if not np.isfinite(ema_val):
             continue
 
-        # Price > EMA filter
         if tail_px.iloc[-1] <= ema_val:
             continue
 
         scores[s] = mom
 
     if not scores:
-        # QC: if no scores, just return (hold whatever / cash)
         continue
 
     top = sorted(scores, key=scores.get, reverse=True)[:STOCK_COUNT]
 
-    # Correlation evaluation on top basket (QC single evaluation)
     avg_corr_top = compute_avg_corr_from_prices(prices, top, t_i, CORR_LOOKBACK)
 
-    # corr_history updated ONLY on rebalance (QC)
     if avg_corr_top is not None and np.isfinite(avg_corr_top):
         corr_history.append(avg_corr_top)
         if len(corr_history) > CORR_Z_LOOKBACK:
             corr_history.pop(0)
 
-    # Kill switch behavior inside Rebalance (QC)
     if kill_switch_active:
         if avg_corr_top is None or avg_corr_top >= CORR_KILL_THRESHOLD:
-            # QC: skip rebalance while still dangerous
             continue
-        # else: clear kill switch and proceed
         kill_switch_active = False
 
-    # If not in kill switch, proceed (QC also checks kill switch earlier daily)
-    # Compute correlation-based scaling with hysteresis (QC)
     target_scale = qc_corr_scaler(avg_corr_top, corr_history)
 
     if target_scale < current_scale:
@@ -255,19 +259,24 @@ for t_i, dt in enumerate(dates):
         alpha = 1.0 / SCALE_RECOVERY_MONTHS
         current_scale += alpha * (target_scale - current_scale)
 
-    # Raw momentum weights (QC)
-    raw = {s: scores[s] for s in top}
-    clean = {s: w for s, w in raw.items() if np.isfinite(w) and w > 0}
-    total = sum(clean.values())
-    if total <= 0:
+    # -------------------------
+    # QC EDGE-BASED WEIGHTS
+    # -------------------------
+    edges = {}
+
+    for s in top:
+        px = prices[s].iloc[:t_i + 1].dropna()
+        edge = compute_edge(px, scores[s])
+        if edge is not None:
+            edges[s] = edge
+
+    if not edges:
         continue
 
-    base_weights = {s: w / total for s, w in clean.items()}
+    total_edge = sum(edges.values())
+    base_weights = {s: w / total_edge for s, w in edges.items()}
 
-    # Iterative cap + renormalize (QC)
     weights = apply_weight_cap(base_weights, MAX_WEIGHT)
-
-    # Apply scale (QC)
     final_weights = {s: w * current_scale for s, w in weights.items()}
 
     holdings = final_weights

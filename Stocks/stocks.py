@@ -53,7 +53,7 @@ class SectorTopUniverse(FundamentalUniverseSelectionModel):
 class StockOnlyMomentum(QCAlgorithm):
 
     def Initialize(self):
-        self.SetStartDate(2004, 1, 1)
+        self.SetStartDate(2010, 1, 1)
         self.SetCash(1_000_000)
 
         # -----------------------------
@@ -63,9 +63,9 @@ class StockOnlyMomentum(QCAlgorithm):
         self.ema_period = 210
         self.momentum_lookbacks = [21, 63, 126, 189, 252]
         self.max_lookback = max(self.momentum_lookbacks)
-
+        self.vol_lookback = 126
+        self.winrate_lookback = 126
         self.max_weight = 0.25
-        self.use_vol_scaling = True
 
         # Correlation controls
         self.corr_lookback = 21
@@ -73,14 +73,16 @@ class StockOnlyMomentum(QCAlgorithm):
         self.corr_kill_threshold = 0.60
 
         # Rolling correlation scaling
-        self.corr_z_lookback = 63
+        self.corr_z_lookback = 126
         self.corr_history = []
-        self.min_scale = 0.10
+        # Risk Scale Factor
+        self.min_scale = 0.30
+        # Exponentail Decay Rate
         self.corr_k = 1.5
 
         # Hysteresis / slow re-risking
         self.current_scale = 1.0
-        self.scale_recovery_months = 3
+        self.scale_recovery_months = 6
 
         self.kill_switch_active = False
 
@@ -250,20 +252,49 @@ class StockOnlyMomentum(QCAlgorithm):
         )
 
         # ------------------------------------------------
-        # Raw momentum weights
+        # Per-stock edge (group logic applied per asset)
         # ------------------------------------------------
-        raw = {s: scores[s] for s in top}
-        clean = {s: w for s, w in raw.items() if np.isfinite(w) and w > 0}
+        edges = {}
 
-        total = sum(clean.values())
-        if total <= 0:
-            self.Debug(
-                f"{self.Time.date()} | ALL MOMENTUM INVALID — DETAILS: " +
-                ", ".join(f"{s.Value}:{raw[s]}" for s in raw)
+        for s in top:
+            px = closes[s].dropna()
+            if len(px) < max(self.winrate_lookback, self.vol_lookback) + 1:
+                continue
+
+            simple_returns = px.pct_change().dropna()
+            log_returns = np.log1p(simple_returns)
+
+            asset_momentum = scores[s]
+
+            win_rate = float(
+                np.mean(log_returns.tail(self.winrate_lookback) > 0)
             )
+
+            asset_vol = float(
+                np.std(log_returns.tail(self.vol_lookback)) * np.sqrt(252)
+            )
+
+            if not np.isfinite(asset_vol) or asset_vol <= 0:
+                continue
+
+            confidence = np.clip(
+                abs(asset_momentum) / (asset_vol + 1e-6),
+                0.0,
+                2.0
+            )
+
+            scale = max(0.1, 1.0 + confidence * np.sign(asset_momentum))
+            edge = win_rate * scale
+
+            if np.isfinite(edge) and edge > 0:
+                edges[s] = edge
+
+        if not edges:
             return
 
-        base_weights = {s: w / total for s, w in clean.items()}
+        total = sum(edges.values())
+        base_weights = {s: w / total for s, w in edges.items()}
+
 
         # ------------------------------------------------
         # Iterative cap with redistribution
@@ -361,7 +392,7 @@ class StockOnlyMomentum(QCAlgorithm):
         return None if np.isnan(avg_corr) else avg_corr
 
     def ComputeCorrScaler(self, avg_corr):
-        if not self.use_vol_scaling or avg_corr is None:
+        if avg_corr is None:
             return 1.0
 
         if len(self.corr_history) < 5:
