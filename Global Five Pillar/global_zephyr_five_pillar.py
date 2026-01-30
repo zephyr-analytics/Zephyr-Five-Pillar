@@ -19,7 +19,7 @@ class ZephyrFivePillar(QCAlgorithm):
         Initialize the algorithm configuration, assets, indicators,
         and scheduled rebalancing.
         """
-        self.set_start_date(2012, 1, 1)
+        self.set_start_date(2010, 1, 1)
         self.set_cash(100_000)
 
         # ============================
@@ -36,7 +36,7 @@ class ZephyrFivePillar(QCAlgorithm):
         self.bond_sma_period = 126
 
         self.sector_count = 2
-        self.group_vol_target = 0.12
+        self.group_vol_target = 0.20
         self.crypto_cap = 0.10
 
         self.momentum_lookbacks = [21, 63, 126, 189, 252]
@@ -114,20 +114,6 @@ class ZephyrFivePillar(QCAlgorithm):
     # trend filter
     # ====================================================
     def passes_trend(self, symbol: Symbol) -> bool:
-        """
-        Determine whether a symbol passes its SMA trend filter.
-
-        Parameters
-        ----------
-        symbol : Symbol
-            The asset symbol to evaluate.
-
-        Returns
-        -------
-        bool
-            True if trend filtering is disabled or the asset price
-            is above its relevant SMA; False otherwise.
-        """
         if not self.enable_sma_filter:
             return True
 
@@ -143,13 +129,6 @@ class ZephyrFivePillar(QCAlgorithm):
     # rebalance
     # ====================================================
     def rebalance(self) -> None:
-        """
-        Monthly rebalance routine.
-
-        Computes momentum, win-rate confidence, volatility-adjusted
-        group weights, applies regime filters, and allocates capital
-        across asset groups with a cash fallback.
-        """
         if self.IsWarmingUp:
             return
 
@@ -164,6 +143,9 @@ class ZephyrFivePillar(QCAlgorithm):
 
         closes = history["close"].unstack(0)
         cash_symbol = self.symbols["cash"][0]
+
+        # --------- NEW: 6m cash benchmark ----------
+        bil_6m = self.six_month_return(cash_symbol, closes)
 
         # -----------------------------
         # duration regimes
@@ -221,6 +203,11 @@ class ZephyrFivePillar(QCAlgorithm):
                     continue
 
                 asset_momentum = self.compute_asset_momentum(s, closes)
+                asset_6m = self.six_month_return(s, closes)
+
+                if asset_6m <= bil_6m:
+                    continue
+
                 if asset_momentum <= 0:
                     continue
 
@@ -231,23 +218,17 @@ class ZephyrFivePillar(QCAlgorithm):
 
             group_assets[group] = eligible
 
-            # group aggregate returns (equal-weighted basket)
             group_simple_returns = closes[eligible].pct_change().mean(axis=1).dropna()
             if len(group_simple_returns) < max(self.winrate_lookback, self.vol_lookback):
                 continue
 
-            # use log returns consistently
             group_log_returns = np.log1p(group_simple_returns)
-
-            # group momentum (unchanged definition)
             group_momentum = self.compute_group_momentum(eligible, closes)
 
-            # win rate computed on same return series
             win_rate = float(
                 np.mean(group_log_returns.tail(self.winrate_lookback) > 0)
             )
 
-            # unified annualized volatility
             group_vol = float(
                 np.std(group_log_returns.tail(self.vol_lookback)) * np.sqrt(252)
             )
@@ -255,7 +236,6 @@ class ZephyrFivePillar(QCAlgorithm):
             if not np.isfinite(group_vol) or group_vol <= 0:
                 continue
 
-            # confidence uses SAME vol
             confidence = np.clip(
                 abs(group_momentum) / (group_vol + 1e-6),
                 0.0,
@@ -328,23 +308,14 @@ class ZephyrFivePillar(QCAlgorithm):
     # ====================================================
     # helpers
     # ====================================================
+    def six_month_return(self, symbol, closes) -> float:
+        if symbol not in closes.columns or len(closes[symbol]) < 127:
+            return -np.inf
+
+        prices = closes[symbol]
+        return float(prices.iloc[-1] / prices.iloc[-127] - 1)
+
     def compute_momentum(self, symbols, closes):
-        """
-        Compute multi-horizon momentum scores for individual symbols.
-
-        Parameters
-        ----------
-        symbols : list[Symbol]
-            Symbols to score.
-        closes : pd.DataFrame
-            DataFrame of adjusted close prices indexed by time.
-
-        Returns
-        -------
-        dict
-            Mapping of Symbol to average compounded return across
-            predefined lookback windows.
-        """
         scores = {}
         for symbol in symbols:
             if symbol not in closes.columns:
@@ -359,29 +330,14 @@ class ZephyrFivePillar(QCAlgorithm):
         return scores
 
     def get_duration_regime_for_group(self, closes, symbols):
-        """
-        Select bond duration exposure based on relative momentum.
-
-        Parameters
-        ----------
-        closes : pd.DataFrame
-            Adjusted close price history.
-        symbols : list[Symbol]
-            Ordered list of bond symbols from shortest to longest duration.
-
-        Returns
-        -------
-        list[Symbol]
-            Subset of symbols representing the active duration regime.
-        """
         def momentum(symbol):
             if symbol not in closes.columns or len(closes[symbol]) < 127:
                 return -np.inf
             prices = closes[symbol]
             return np.mean([
-                prices.iloc[-1] / prices.iloc[-21] - 1,
-                prices.iloc[-1] / prices.iloc[-63] - 1,
-                prices.iloc[-1] / prices.iloc[-126] - 1,
+                prices.iloc[-1] / prices.iloc[-22] - 1,
+                prices.iloc[-1] / prices.iloc[-64] - 1,
+                prices.iloc[-1] / prices.iloc[-127] - 1,
             ])
 
         if len(symbols) == 3:
@@ -401,48 +357,25 @@ class ZephyrFivePillar(QCAlgorithm):
         return symbols
 
     def compute_group_momentum(self, symbols, closes):
-        """
-        Compute aggregate momentum for a group of symbols.
-
-        Parameters
-        ----------
-        symbols : list[Symbol]
-            Symbols in the group.
-        closes : pd.DataFrame
-            Adjusted close price history.
-
-        Returns
-        -------
-        float
-            Mean multi-horizon momentum across all eligible symbols
-            in the group.
-        """
         values = []
         for symbol in symbols:
             if symbol not in closes.columns or len(closes[symbol]) < 253:
                 continue
             prices = closes[symbol]
             values.append(np.mean([
-                prices.iloc[-1] / prices.iloc[-21] - 1,
-                prices.iloc[-1] / prices.iloc[-63] - 1,
-                prices.iloc[-1] / prices.iloc[-126] - 1,
-                prices.iloc[-1] / prices.iloc[-189] - 1,
-                prices.iloc[-1] / prices.iloc[-252] - 1,
+                prices.iloc[-1] / prices.iloc[-22] - 1,
+                prices.iloc[-1] / prices.iloc[-64] - 1,
+                prices.iloc[-1] / prices.iloc[-127] - 1,
+                prices.iloc[-1] / prices.iloc[-190] - 1,
+                prices.iloc[-1] / prices.iloc[-253] - 1,
             ]))
         return float(np.mean(values)) if values else 0.0
 
     def compute_asset_momentum(self, symbol, closes) -> float:
-        """
-        Compute multi-horizon momentum for a single asset.
-
-        Returns the average compounded return across
-        self.momentum_lookbacks.
-        """
         if symbol not in closes.columns or len(closes[symbol]) < self.max_lookback + 1:
             return -np.inf
 
         prices = closes[symbol]
-
         return float(np.mean([
             prices.iloc[-1] / prices.iloc[-(lb + 1)] - 1
             for lb in self.momentum_lookbacks

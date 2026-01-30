@@ -5,7 +5,7 @@ import yfinance as yf
 # ============================
 # USER CONFIG (MATCHES QC)
 # ============================
-GROUP_VOL_TARGET = 0.18
+GROUP_VOL_TARGET = 0.20
 CRYPTO_CAP = 0.10
 
 ENABLE_SMA_FILTER = True
@@ -94,6 +94,15 @@ def group_momentum(tickers):
     return float(np.mean(vals)) if vals else 0.0
 
 # ============================
+# 6-MONTH RETURN (QC EXACT)   <-- NEW
+# ============================
+def six_month_return(ticker):
+    if ticker not in data or len(data[ticker]) < 127:
+        return -np.inf
+    px = data[ticker]
+    return px.iloc[-1] / px.iloc[-127] - 1
+
+# ============================
 # DURATION REGIME (QC EXACT)
 # ============================
 def duration_regime(symbols):
@@ -102,22 +111,22 @@ def duration_regime(symbols):
             return -np.inf
         px = data[t]
         return np.mean([
-            px.iloc[-1]/px.iloc[-21]-1,
-            px.iloc[-1]/px.iloc[-63]-1,
-            px.iloc[-1]/px.iloc[-126]-1,
+            px.iloc[-1]/px.iloc[-22]-1,
+            px.iloc[-1]/px.iloc[-64]-1,
+            px.iloc[-1]/px.iloc[-127]-1,
         ])
 
     if len(symbols) == 3:
-        s,i,l = symbols
+        s, i, l = symbols
         return (
-            [s,i,l] if m(l) > m(i) > m(s)
-            else [s,i] if m(i) > m(s)
+            [s, i, l] if m(l) > m(i) > m(s)
+            else [s, i] if m(i) > m(s)
             else [s]
         )
 
     if len(symbols) == 2:
-        s,l = symbols
-        return [s,l] if m(l) > m(s) else [s]
+        s, l = symbols
+        return [s, l] if m(l) > m(s) else [s]
 
     return symbols
 
@@ -147,6 +156,10 @@ if ENABLE_SECTORS:
 edges, vols = {}, {}
 group_assets = {}
 
+# ---- NEW: compute BIL 6m once (QC exact)
+cash_symbol = GROUPS["cash"][0]
+bil_6m = six_month_return(cash_symbol)
+
 for group, symbols in risk_groups.items():
     eligible = []
 
@@ -155,8 +168,14 @@ for group, symbols in risk_groups.items():
             continue
         if not passes_trend(s):
             continue
+
+        # ---- NEW: 6m relative return vs cash (QC exact)
+        if six_month_return(s) <= bil_6m:
+            continue
+
         if momentum(s) <= 0:
             continue
+
         eligible.append(s)
 
     if not eligible:
