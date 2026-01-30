@@ -5,7 +5,7 @@ import yfinance as yf
 # ============================
 # USER CONFIG (MATCHES QC)
 # ============================
-GROUP_VOL_TARGET = 0.50
+GROUP_VOL_TARGET = 0.18
 CRYPTO_CAP = 0.10
 
 ENABLE_SMA_FILTER = True

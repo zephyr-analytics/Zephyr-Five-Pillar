@@ -40,7 +40,9 @@ class SectorTopUniverse(FundamentalUniverseSelectionModel):
             sector_buckets[sector].append(f)
 
         selected = []
-        for _, stocks in sector_buckets.items():
+
+        for sector in sorted(sector_buckets.keys()):
+            stocks = sector_buckets[sector]
             stocks.sort(key=lambda f: f.market_cap, reverse=True)
             selected.extend(s.symbol for s in stocks[:75])
 
@@ -70,15 +72,16 @@ class StockOnlyMomentum(QCAlgorithm):
         # Correlation controls
         self.corr_lookback = 21
         self.corr_kill_threshold = float(self.get_parameter("corr_threshold"))
-        self.corr_kill_threshold = 0.60
+        # self.corr_kill_threshold = 0.60
 
-        # Rolling correlation scaling
-        self.corr_z_lookback = 126
+        # Market Risk Controls
+        self.corr_z_lookback = 252
         self.corr_history = []
         # Risk Scale Factor
-        self.min_scale = 0.30
+        self.min_scale = 0.40
         # Exponentail Decay Rate
-        self.corr_k = 1.5
+        self.corr_k = 1.0
+        self.corr_warmup_done = False
 
         # Hysteresis / slow re-risking
         self.current_scale = 1.0
@@ -102,6 +105,12 @@ class StockOnlyMomentum(QCAlgorithm):
             self.DateRules.MonthEnd(),
             self.TimeRules.BeforeMarketClose("SPY", 5),
             self.Rebalance
+        )
+
+        self.Schedule.On(
+            self.DateRules.EveryDay("SPY"),
+            self.TimeRules.AfterMarketOpen("SPY", 5),
+            self.DailyRiskCheck
         )
 
         self.Schedule.On(
@@ -132,6 +141,37 @@ class StockOnlyMomentum(QCAlgorithm):
             self.Debug(
                 f"{self.Time.date()} | CORR KILL | "
                 f"AvgCorr={avg_corr:.2f} → CASH"
+            )
+
+    def OnData(self, data):
+        # ------------------------------------------------
+        # Warm-up correlation history bootstrap
+        # ------------------------------------------------
+        if not self.IsWarmingUp or self.corr_warmup_done:
+            return
+
+        # Use currently available universe symbols
+        symbols = sorted(self.stock_symbols)
+        if len(symbols) < 2:
+            return
+
+        avg_corr = self.ComputeAverageCorrelation(symbols)
+        if avg_corr is None or not np.isfinite(avg_corr):
+            return
+
+        self.corr_history.append(avg_corr)
+        if len(self.corr_history) > self.corr_z_lookback:
+            self.corr_history.pop(0)
+
+        # Once we have enough history, lock it in
+        if len(self.corr_history) >= min(30, self.corr_z_lookback):
+            self.corr_warmup_done = True
+
+            self.Debug(
+                f"{self.Time.date()} | CORR WARMUP COMPLETE | "
+                f"n={len(self.corr_history)} "
+                f"μ={np.mean(self.corr_history):.3f} "
+                f"σ={np.std(self.corr_history):.3f}"
             )
 
     # ------------------------------------------------
@@ -305,7 +345,8 @@ class StockOnlyMomentum(QCAlgorithm):
             excess = 0.0
             free = {}
 
-            for s, w in weights.items():
+            for s in sorted(weights):
+                w = weights[s]
                 if w > self.max_weight:
                     excess += w - self.max_weight
                     weights[s] = self.max_weight
@@ -318,7 +359,7 @@ class StockOnlyMomentum(QCAlgorithm):
             free_total = sum(free.values())
             redistributed = False
 
-            for s in free:
+            for s in sorted(free):
                 add = excess * (free[s] / free_total)
                 new_w = weights[s] + add
                 if new_w > self.max_weight:
@@ -332,7 +373,7 @@ class StockOnlyMomentum(QCAlgorithm):
 
         total = sum(weights.values())
         if total > 0:
-            for s in weights:
+            for s in sorted(weights):
                 weights[s] /= total
 
         final_weights = {s: w * vol_scale for s, w in weights.items()}
