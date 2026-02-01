@@ -1,26 +1,23 @@
 from AlgorithmImports import *
 from typing import Dict, List
 import numpy as np
-import pandas as pd
 
 
 class ZephyrFivePillar(QCAlgorithm):
     """
     Multi-asset, regime-aware allocation strategy using momentum,
-    trend filtering, win-rate confidence scaling, and volatility targeting.
+    trend filtering, and volatility-adjusted win-rate confidence.
 
-    Asset groups are scored independently and allocated dynamically,
-    with optional sector selection, SMA trend filters, and a
-    treasury-based kill switch.
+    Volatility is used ONLY to penalize noisy signals in edge construction.
+    There is NO volatility targeting or exposure scaling.
     """
 
+    # ====================================================
+    # initialize
+    # ====================================================
     def initialize(self) -> None:
-        """
-        Initialize the algorithm configuration, assets, indicators,
-        and scheduled rebalancing.
-        """
-        self.set_start_date(2010, 1, 1)
-        self.set_cash(100_000)
+        self.SetStartDate(2012, 1, 1)
+        self.SetCash(100_000)
 
         # ============================
         # user options
@@ -34,9 +31,7 @@ class ZephyrFivePillar(QCAlgorithm):
 
         self.sma_period = 147
         self.bond_sma_period = 126
-
         self.sector_count = 2
-        self.group_vol_target = 0.20
         self.crypto_cap = 0.10
 
         self.momentum_lookbacks = [21, 63, 126, 189, 252]
@@ -56,7 +51,7 @@ class ZephyrFivePillar(QCAlgorithm):
                 "EXI", "IXN", "MXI", "REET", "JXI"
             ],
             "crypto": ["BTCUSD", "ETHUSD"],
-            "cash": ["BIL"]
+            "cash": ["SHV"]
         }
 
         self.symbols: Dict[str, List[Symbol]] = {}
@@ -126,6 +121,23 @@ class ZephyrFivePillar(QCAlgorithm):
         return sma and sma.IsReady and self.Securities[symbol].Price > sma.Current.Value
 
     # ====================================================
+    # NEW: treasury trend-only kill helper
+    # ====================================================
+    def all_treasuries_fail_trend(self) -> bool:
+        """
+        Kill risk only if ALL treasury assets fail the trend filter.
+        """
+        if not self.enable_sma_filter:
+            return False
+
+        for s in self.symbols["treasury_bonds"]:
+            sma = self.bond_smas.get(s)
+            if sma and sma.IsReady and self.Securities[s].Price > sma.Current.Value:
+                return False  # at least one treasury passes trend
+
+        return True
+
+    # ====================================================
     # rebalance
     # ====================================================
     def rebalance(self) -> None:
@@ -144,12 +156,8 @@ class ZephyrFivePillar(QCAlgorithm):
         closes = history["close"].unstack(0)
         cash_symbol = self.symbols["cash"][0]
 
-        # --------- NEW: 6m cash benchmark ----------
         bil_6m = self.six_month_return(cash_symbol, closes)
 
-        # -----------------------------
-        # duration regimes
-        # -----------------------------
         corp_bonds = self.get_duration_regime_for_group(
             closes, self.symbols["corp_bonds"]
         )
@@ -160,9 +168,6 @@ class ZephyrFivePillar(QCAlgorithm):
             closes, self.symbols["high_yield_bonds"]
         )
 
-        # -----------------------------
-        # sector selection
-        # -----------------------------
         sector_symbols = []
         if self.enable_sectors:
             sector_momentum = self.compute_momentum(self.symbols["sectors"], closes)
@@ -172,9 +177,6 @@ class ZephyrFivePillar(QCAlgorithm):
                 reverse=True
             )[:self.sector_count]
 
-        # -----------------------------
-        # risk groups
-        # -----------------------------
         risk_groups = {
             "real": self.symbols["real"],
             "corp_bonds": corp_bonds,
@@ -188,14 +190,16 @@ class ZephyrFivePillar(QCAlgorithm):
             risk_groups["sectors"] = sector_symbols
 
         edges = {}
-        vols = {}
         group_assets = {}
+        group_asset_edges = {}
 
-        # -----------------------------
-        # group scoring
-        # -----------------------------
+        # ============================
+        # group + asset edge construction
+        # ============================
         for group, symbols in risk_groups.items():
             eligible = []
+            asset_edges = {}
+
             for s in symbols:
                 if s not in closes.columns:
                     continue
@@ -205,76 +209,64 @@ class ZephyrFivePillar(QCAlgorithm):
                 asset_momentum = self.compute_asset_momentum(s, closes)
                 asset_6m = self.six_month_return(s, closes)
 
-                if asset_6m <= bil_6m:
+                if asset_6m <= bil_6m or asset_momentum <= 0:
                     continue
 
-                if asset_momentum <= 0:
-                    continue
-
+                asset_edge = max(0.0, asset_momentum)
                 eligible.append(s)
+                asset_edges[s] = asset_edge
 
             if not eligible:
                 continue
 
             group_assets[group] = eligible
+            group_asset_edges[group] = asset_edges
 
             group_simple_returns = closes[eligible].pct_change().mean(axis=1).dropna()
             if len(group_simple_returns) < max(self.winrate_lookback, self.vol_lookback):
                 continue
 
-            group_log_returns = np.log1p(group_simple_returns)
-            group_momentum = self.compute_group_momentum(eligible, closes)
-
+            log_group = np.log1p(group_simple_returns)
             win_rate = float(
-                np.mean(group_log_returns.tail(self.winrate_lookback) > 0)
+                np.mean(log_group.tail(self.winrate_lookback) > 0)
             )
 
+            group_momentum = self.compute_group_momentum(eligible, closes)
             group_vol = float(
-                np.std(group_log_returns.tail(self.vol_lookback)) * np.sqrt(252)
+                np.std(log_group.tail(self.vol_lookback)) * np.sqrt(252)
             )
 
             if not np.isfinite(group_vol) or group_vol <= 0:
                 continue
 
-            confidence = np.clip(
-                abs(group_momentum) / (group_vol + 1e-6),
-                0.0,
-                2.0
-            )
+            confidence = group_momentum / (group_vol + 1e-6)
 
-            scale = max(0.1, 1.0 + confidence * np.sign(group_momentum))
-            edge = win_rate * scale
-
-            edges[group] = edge
-            vols[group] = group_vol
+            edges[group] = win_rate * max(0.1, 1.0 + confidence)
 
         if not edges:
             self.SetHoldings(cash_symbol, 1.0)
             return
 
-        # -----------------------------
-        # treasury kill switch
-        # -----------------------------
-        if self.enable_treasury_kill_switch and "treasury_bonds" not in edges:
+        # ====================================================
+        # UPDATED TREASURY KILL SWITCH (trend-only)
+        # ====================================================
+        if self.enable_treasury_kill_switch and self.all_treasuries_fail_trend():
             self.SetHoldings(cash_symbol, 1.0)
-            self.Debug(f"{self.Time.date()} | treasury kill switch → cash")
+            self.Debug("TREASURY KILL SWITCH: all treasuries failed trend")
             return
 
-        # -----------------------------
-        # normalize + vol targeting
-        # -----------------------------
+        # ============================
+        # group weights
+        # ============================
         effective_edges = {g: e + 0.01 for g, e in edges.items()}
         total_edge = sum(effective_edges.values())
 
         weights = {
-            g: (effective_edges[g] / total_edge)
-            * min(1.0, self.group_vol_target / vols[g])
+            g: effective_edges[g] / total_edge
             for g in effective_edges
         }
 
-        # -----------------------------
         # crypto cap
-        # -----------------------------
         if "crypto" in weights and weights["crypto"] > self.crypto_cap:
             excess = weights["crypto"] - self.crypto_cap
             weights["crypto"] = self.crypto_cap
@@ -283,35 +275,42 @@ class ZephyrFivePillar(QCAlgorithm):
             for g in others:
                 weights[g] += excess * (weights[g] / total_other)
 
-        risk_weight = sum(weights.values())
-        cash_weight = max(0.0, 1.0 - risk_weight)
+        cash_weight = max(0.0, 1.0 - sum(weights.values()))
 
-        # -----------------------------
-        # allocate
-        # -----------------------------
+        # ============================
+        # intra-group allocation (EDGE ONLY)
+        # ============================
         for group, group_weight in weights.items():
             symbols = group_assets.get(group, [])
             if not symbols:
                 continue
 
-            alloc = group_weight / len(symbols)
-            for symbol in symbols:
-                self.SetHoldings(symbol, alloc)
+            edges_i = {
+                s: group_asset_edges[group][s] + 0.01
+                for s in symbols
+            }
+
+            edge_sum = sum(edges_i.values())
+            if edge_sum <= 0:
+                continue
+
+            for s, edge in edges_i.items():
+                self.SetHoldings(s, group_weight * edge / edge_sum)
 
         self.SetHoldings(cash_symbol, cash_weight)
 
         self.Debug(
-            f"{self.Time.date()} | risk={risk_weight:.3f} cash={cash_weight:.3f} | "
-            + ", ".join(f"{g}:{w:.3f}" for g, w in weights.items())
+            "GROUPS | "
+            + " | ".join(f"{g}:{w:.2f}" for g, w in sorted(weights.items()))
+            + f" | cash:{cash_weight:.2f}"
         )
 
     # ====================================================
-    # helpers
+    # helpers (UNCHANGED)
     # ====================================================
     def six_month_return(self, symbol, closes) -> float:
         if symbol not in closes.columns or len(closes[symbol]) < 127:
             return -np.inf
-
         prices = closes[symbol]
         return float(prices.iloc[-1] / prices.iloc[-127] - 1)
 
@@ -374,7 +373,6 @@ class ZephyrFivePillar(QCAlgorithm):
     def compute_asset_momentum(self, symbol, closes) -> float:
         if symbol not in closes.columns or len(closes[symbol]) < self.max_lookback + 1:
             return -np.inf
-
         prices = closes[symbol]
         return float(np.mean([
             prices.iloc[-1] / prices.iloc[-(lb + 1)] - 1

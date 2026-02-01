@@ -5,11 +5,11 @@ import yfinance as yf
 # ============================
 # USER CONFIG (MATCHES QC)
 # ============================
-GROUP_VOL_TARGET = 0.20
+GROUP_VOL_TARGET = 0.15
 CRYPTO_CAP = 0.10
 
 ENABLE_SMA_FILTER = True
-ENABLE_SECTORS = True
+ENABLE_SECTORS = False
 ENABLE_TREASURY_KILL_SWITCH = True
 
 WINRATE_LOOKBACK = 126
@@ -37,7 +37,7 @@ GROUPS = {
         "EXI", "IXN", "MXI", "REET", "JXI"
     ],
     "crypto": ["IBIT", "ETHA"],
-    "cash": ["BIL"]
+    "cash": ["SHV"]
 }
 
 BOND_GROUPS = {"corp_bonds", "treasury_bonds", "high_yield_bonds"}
@@ -61,7 +61,7 @@ def sma(series, n):
     return series.rolling(n).mean()
 
 # ============================
-# TREND FILTER (QC LOGIC)
+# TREND FILTER (QC EXACT)
 # ============================
 def passes_trend(ticker):
     if not ENABLE_SMA_FILTER:
@@ -69,10 +69,7 @@ def passes_trend(ticker):
 
     px = data[ticker]
 
-    if ticker in sum(
-        [GROUPS[g] for g in BOND_GROUPS],
-        []
-    ):
+    if ticker in sum([GROUPS[g] for g in BOND_GROUPS], []):
         ma = sma(px, BOND_SMA_PERIOD)
     else:
         ma = sma(px, SMA_PERIOD)
@@ -94,7 +91,7 @@ def group_momentum(tickers):
     return float(np.mean(vals)) if vals else 0.0
 
 # ============================
-# 6-MONTH RETURN (QC EXACT)   <-- NEW
+# 6-MONTH RETURN (QC EXACT)
 # ============================
 def six_month_return(ticker):
     if ticker not in data or len(data[ticker]) < 127:
@@ -156,49 +153,71 @@ if ENABLE_SECTORS:
 edges, vols = {}, {}
 group_assets = {}
 
-# ---- NEW: compute BIL 6m once (QC exact)
+# >>> NEW: asset-level storage (QC match)
+group_asset_edges = {}
+group_asset_vols = {}
+
 cash_symbol = GROUPS["cash"][0]
 bil_6m = six_month_return(cash_symbol)
 
 for group, symbols in risk_groups.items():
     eligible = []
+    asset_edges = {}
+    asset_vols = {}
 
     for s in symbols:
         if s not in data:
             continue
         if not passes_trend(s):
             continue
-
-        # ---- NEW: 6m relative return vs cash (QC exact)
         if six_month_return(s) <= bil_6m:
             continue
 
-        if momentum(s) <= 0:
+        mom = momentum(s)
+        if mom <= 0:
             continue
 
+        rets = data[s].pct_change().dropna()
+        if len(rets) < max(WINRATE_LOOKBACK, VOL_LOOKBACK):
+            continue
+
+        log_rets = np.log1p(rets)
+
+        win_rate = (log_rets.tail(WINRATE_LOOKBACK) > 0).mean()
+        vol = np.std(log_rets.tail(VOL_LOOKBACK)) * np.sqrt(252)
+
+        if not np.isfinite(vol) or vol <= 0:
+            continue
+
+        confidence = np.clip(abs(mom) / (vol + 1e-6), 0.0, 2.0)
+        scale = max(0.1, 1.0 + confidence * np.sign(mom))
+
+        asset_edges[s] = win_rate * scale
+        asset_vols[s] = vol
         eligible.append(s)
 
     if not eligible:
         continue
 
     group_assets[group] = eligible
+    group_asset_edges[group] = asset_edges
+    group_asset_vols[group] = asset_vols
 
     simple_rets = data[eligible].pct_change().mean(axis=1).dropna()
     if len(simple_rets) < max(WINRATE_LOOKBACK, VOL_LOOKBACK):
         continue
 
     log_rets = np.log1p(simple_rets)
-
-    mom = group_momentum(eligible)
+    group_mom = group_momentum(eligible)
 
     win_rate = (log_rets.tail(WINRATE_LOOKBACK) > 0).mean()
-
     vol = np.std(log_rets.tail(VOL_LOOKBACK)) * np.sqrt(252)
+
     if not np.isfinite(vol) or vol <= 0:
         continue
 
-    confidence = np.clip(abs(mom) / (vol + 1e-6), 0.0, 2.0)
-    scale = max(0.1, 1.0 + confidence * np.sign(mom))
+    confidence = np.clip(abs(group_mom) / (vol + 1e-6), 0.0, 2.0)
+    scale = max(0.1, 1.0 + confidence * np.sign(group_mom))
 
     edges[group] = win_rate * scale
     vols[group] = vol
@@ -241,12 +260,25 @@ cash_weight = max(0.0, 1.0 - sum(weights.values()))
 # ============================
 allocations = {}
 
-for group, w in weights.items():
+for group, gw in weights.items():
     symbols = group_assets.get(group, [])
     if not symbols:
         continue
-    for s in symbols:
-        allocations[s] = w / len(symbols)
+
+    edges_i = {s: group_asset_edges[group][s] + 0.01 for s in symbols}
+    vols_i = {s: group_asset_vols[group][s] for s in symbols}
+
+    edge_sum = sum(edges_i.values())
+
+    raw = {
+        s: (edges_i[s] / edge_sum)
+        * min(1.0, GROUP_VOL_TARGET / vols_i[s])
+        for s in symbols
+    }
+
+    norm = sum(raw.values())
+    for s, w in raw.items():
+        allocations[s] = gw * w / norm
 
 allocations["BIL"] = cash_weight
 
